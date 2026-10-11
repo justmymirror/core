@@ -11,6 +11,7 @@ package osfirewall
 
 import (
 	"fmt"
+	"math"
 	"net/netip"
 	"os"
 	"sync"
@@ -519,7 +520,10 @@ func (f *WindowsFirewall) createSession() error {
 		return err
 	}
 
-	// fresh sublayer
+	// fresh sublayer. Weight is this sublayer's priority relative to other
+	// sublayers on the system, unrelated to the filter weight constants above, which only
+	// order rules within this sublayer. We max it out so nothing else on the
+	// system can prioritize over our rules.
 	guid, err = windows.GenerateGUID()
 	if err != nil {
 		return err
@@ -528,7 +532,7 @@ func (f *WindowsFirewall) createSession() error {
 	if err := f.session.AddSublayer(&wf.Sublayer{
 		ID:     f.sublayerID,
 		Name:   "WG Tunnel permissive and blocking filters",
-		Weight: uint16(weightCatchAll),
+		Weight: math.MaxUint16,
 	}); err != nil {
 		return err
 	}

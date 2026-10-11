@@ -796,7 +796,13 @@ func sortNets(s []netip.Prefix) {
 }
 
 func (r *windowsRouter) getGlobalSearchDomains() ([]string, error) {
-	cmd := exec.Command("powershell", "-Command", "(Get-DnsClientGlobalSetting).SuffixSearchList")
+	cmd := exec.Command(
+		"powershell",
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command",
+		"(Get-DnsClientGlobalSetting).SuffixSearchList",
+	)
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -817,7 +823,13 @@ func (r *windowsRouter) setPrivateNetwork() (bool, error) {
 	alias := r.iface
 
 	// Check if visible and get current category
-	cmd := exec.Command("powershell", "-Command", fmt.Sprintf(`Get-NetConnectionProfile -InterfaceAlias "%s" | Select-Object -ExpandProperty NetworkCategory`, alias))
+	cmd := exec.Command(
+		"powershell",
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command",
+		fmt.Sprintf(`Get-NetConnectionProfile -InterfaceAlias "%s" | Select-Object -ExpandProperty NetworkCategory`, alias),
+	)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Debug(tag, "setPrivateNetwork: Get-NetConnectionProfile failed: %v", err)
@@ -836,7 +848,13 @@ func (r *windowsRouter) setPrivateNetwork() (bool, error) {
 	}
 
 	// Set to Private
-	cmd = exec.Command("powershell", "-Command", fmt.Sprintf(`Set-NetConnectionProfile -InterfaceAlias "%s" -NetworkCategory Private`, alias))
+	cmd = exec.Command(
+		"powershell",
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command",
+		fmt.Sprintf(`Set-NetConnectionProfile -InterfaceAlias "%s" -NetworkCategory Private`, alias),
+	)
 	output, err = cmd.CombinedOutput()
 	if err != nil {
 		log.Error(tag, "setPrivateNetwork: Set-NetConnectionProfile failed: %v (output: %s)", err, output)

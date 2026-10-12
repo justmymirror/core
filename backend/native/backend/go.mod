@@ -45,4 +45,6 @@ replace github.com/amnezia-vpn/amneziawg-go/v3 => github.com/wgtunnel/amneziawg-
 
 // replace github.com/amnezia-vpn/amneziawg-go/v3 => ../../../../amneziawg-go
 
-replace github.com/artem-russkikh/wireproxy-awg => github.com/wgtunnel/wireproxy-awg v0.0.0-20261009064755-f37e5b28cd56
+replace github.com/artem-russkikh/wireproxy-awg => github.com/wgtunnel/wireproxy-awg v0.0.0-20261012102340-6f0546300c21
+
+// replace github.com/artem-russkikh/wireproxy-awg => ../../../../wireproxy-awg

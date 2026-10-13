@@ -14,11 +14,9 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
-	"os/exec"
 	"slices"
 	"sort"
-	"strings"
-	"syscall"
+	"sync"
 	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
@@ -36,14 +34,18 @@ import (
 const tag = "Router"
 
 type windowsRouter struct {
-	iface                 string
-	fw                    *osfirewall.WindowsFirewall
-	prevConfig            *router.Config
-	v6Available           bool
-	nativeTun             *tun.NativeTun
-	luid                  winipcfg.LUID
-	rawLuid               uint64
-	originalSearchDomains []string
+	iface       string
+	fw          *osfirewall.WindowsFirewall
+	prevConfig  *router.Config
+	v6Available bool
+	nativeTun   *tun.NativeTun
+	luid        winipcfg.LUID
+	rawLuid     uint64
+
+	// privateStarted guards the one background NLA category pass per router.
+	// The adapter profile is often published after Set returns.
+	privateMu      sync.Mutex
+	privateStarted bool
 
 	originalGateway  netip.Addr
 	originalGateway6 netip.Addr
@@ -115,13 +117,6 @@ func (r *windowsRouter) Set(c *router.Config) error {
 	isPrevFull := prevC.HasAnyDefaultRoute()
 	isNewFull := newC.HasAnyDefaultRoute()
 	if !slices.Equal(newC.DNS, prevC.DNS) || !slices.Equal(newC.SearchDomains, prevC.SearchDomains) || isNewFull != isPrevFull {
-		if isNewFull && r.originalSearchDomains == nil {
-			var err error
-			r.originalSearchDomains, err = r.getGlobalSearchDomains()
-			if err != nil {
-				log.Error(tag, "Failed to get original search domains: %v", err)
-			}
-		}
 		if err := dns.SetDNS(
 			r.ctx,
 			r.iface, // name, not LUID
@@ -265,9 +260,10 @@ func (r *windowsRouter) configureInterface(cfg *router.Config) error {
 		return fmt.Errorf("getting interface: %v", err)
 	}
 
-	_, err = r.setPrivateNetwork()
-	if err != nil {
-		log.Debug(tag, "**WARNING** failed to set private network: %v", err)
+	// Private category is for LAN discovery on the tunnel adapter. NLA often
+	// publishes the adapter after routes exist, so this must not block Set
+	if cfg != nil && !cfg.Equal(&router.Config{}) {
+		r.ensurePrivateNetwork()
 	}
 
 	// redirect the physical interface on each call to Set. v4 and v6 are looked up and tracked
@@ -795,76 +791,6 @@ func sortNets(s []netip.Prefix) {
 	})
 }
 
-func (r *windowsRouter) getGlobalSearchDomains() ([]string, error) {
-	cmd := exec.Command(
-		"powershell",
-		"-NoProfile",
-		"-NonInteractive",
-		"-Command",
-		"(Get-DnsClientGlobalSetting).SuffixSearchList",
-	)
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-	lines := strings.Split(strings.TrimSpace(string(output)), "\r\n")
-	var domains []string
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed != "" {
-			domains = append(domains, trimmed)
-		}
-	}
-	return domains, nil
-}
-
-// important for LAN access and service discovery
-func (r *windowsRouter) setPrivateNetwork() (bool, error) {
-	alias := r.iface
-
-	// Check if visible and get current category
-	cmd := exec.Command(
-		"powershell",
-		"-NoProfile",
-		"-NonInteractive",
-		"-Command",
-		fmt.Sprintf(`Get-NetConnectionProfile -InterfaceAlias "%s" | Select-Object -ExpandProperty NetworkCategory`, alias),
-	)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Debug(tag, "setPrivateNetwork: Get-NetConnectionProfile failed: %v", err)
-		return false, err
-	}
-
-	category := strings.TrimSpace(string(output))
-	if category == "" {
-		log.Debug(tag, "setPrivateNetwork: Adapter not found")
-		return false, nil
-	}
-
-	if category == "Private" || category == "DomainAuthenticated" {
-		log.Debug(tag, "setPrivateNetwork: Already private/domain, skipping")
-		return true, nil
-	}
-
-	// Set to Private
-	cmd = exec.Command(
-		"powershell",
-		"-NoProfile",
-		"-NonInteractive",
-		"-Command",
-		fmt.Sprintf(`Set-NetConnectionProfile -InterfaceAlias "%s" -NetworkCategory Private`, alias),
-	)
-	output, err = cmd.CombinedOutput()
-	if err != nil {
-		log.Error(tag, "setPrivateNetwork: Set-NetConnectionProfile failed: %v (output: %s)", err, output)
-		return false, err
-	}
-
-	log.Debug(tag, "setPrivateNetwork: Success")
-	return true, nil
-}
-
 // interfaceFromLUID returns IPAdapterAddresses with specified LUID.
 func interfaceFromLUID(luid winipcfg.LUID, flags winipcfg.GAAFlags) (*winipcfg.IPAdapterAddresses, error) {
 	addresses, err := winipcfg.GetAdaptersAddresses(windows.AF_UNSPEC, flags)
@@ -879,19 +805,18 @@ func interfaceFromLUID(luid winipcfg.LUID, flags winipcfg.GAAFlags) (*winipcfg.I
 	return nil, fmt.Errorf("interfaceFromLUID: interface with LUID %v not found", luid)
 }
 
-// Flush clears the local resolver cache.
-// Only Windows has a public dns.Flush, needed in router_windows.go. Other
-// platforms like Linux need a different flush implementation depending on
-// the DNS manager. There is a FlushCaches method on the manager which
-// can be used on all platforms.
+var procDnsFlushResolverCache = windows.NewLazySystemDLL("dnsapi.dll").NewProc("DnsFlushResolverCache")
+
 func flushCaches() error {
-	cmd := exec.Command("ipconfig", "/flushdns")
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: windows.DETACHED_PROCESS,
+	if err := procDnsFlushResolverCache.Find(); err != nil {
+		return err
 	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%v (output: %s)", err, out)
+	r, _, err := procDnsFlushResolverCache.Call()
+	if r == 0 {
+		if err != nil && err != windows.ERROR_SUCCESS {
+			return fmt.Errorf("DnsFlushResolverCache: %w", err)
+		}
+		return errors.New("DnsFlushResolverCache failed")
 	}
 	return nil
 }

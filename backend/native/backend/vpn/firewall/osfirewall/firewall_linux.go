@@ -34,16 +34,16 @@ const (
 	chainNameInput  = "input"
 	chainNameOutput = "output"
 
-	legacyTableFilter = "filter"
-	legacyTableNat    = "nat"
-	legacyChainInput  = "INPUT"
-	legacyChainOutput = "OUTPUT"
-	legacyChainForward = "FORWARD"
+	legacyTableFilter      = "filter"
+	legacyTableNat         = "nat"
+	legacyChainInput       = "INPUT"
+	legacyChainOutput      = "OUTPUT"
+	legacyChainForward     = "FORWARD"
 	legacyChainPostrouting = "POSTROUTING"
-	legacyJumpInput   = "wgtunnel-input"
-	legacyJumpOutput  = "wgtunnel-output"
-	legacyJumpForward = "wgtunnel-forward"
-	legacyJumpPostrouting = "wgtunnel-postrouting"
+	legacyJumpInput        = "wgtunnel-input"
+	legacyJumpOutput       = "wgtunnel-output"
+	legacyJumpForward      = "wgtunnel-forward"
+	legacyJumpPostrouting  = "wgtunnel-postrouting"
 
 	tag = "LinuxFirewall"
 )
@@ -286,42 +286,46 @@ func (f *LinuxFirewall) AllowLocalNetworks(prefixes []netip.Prefix) error {
 	// remove any old rules
 	f.RemoveLocalNetworks()
 
-	// add bypass rules for each prefix
+	// Accept on input and output, before the terminal drop. A prefix only goes
+	// on the table of its own family. The kernel accepts the other family's
+	// payload compare, but that compare does not match the addresses.
 	for _, table := range f.getTables() {
-		outputChain, err := getChainFromTable(f.conn, table.Filter, chainNameOutput)
-		if err != nil {
-			return fmt.Errorf("get output chain: %w", err)
-		}
-
-		// temp remove drop rules
-		dropTemplate := createDropRule(table.Filter, outputChain)
-		existingDrop, err := findRule(f.conn, dropTemplate)
-		if err != nil {
-			return fmt.Errorf("find drop rule: %w", err)
-		}
-		if existingDrop != nil {
-			f.conn.DelRule(existingDrop)
-		}
-
-		// add the local bypass rules
-		for _, prefix := range prefixes {
-			if prefix.Addr().Is6() && !f.v6Available {
-				continue
-			}
-			rule, err := createRangeRule(table.Filter, outputChain, prefix, expr.VerdictAccept)
+		for _, chainName := range []string{chainNameInput, chainNameOutput} {
+			chain, err := getChainFromTable(f.conn, table.Filter, chainName)
 			if err != nil {
-				return fmt.Errorf("create bypass rule for %v: %w", prefix, err)
+				return fmt.Errorf("get %s chain: %w", chainName, err)
 			}
-			existing, _ := findRule(f.conn, rule)
-			if existing == nil {
-				f.conn.AddRule(rule)
-				f.localAddrRules = append(f.localAddrRules, rule)
-			}
-		}
 
-		// add drop rule back
-		dropRule := createDropRule(table.Filter, outputChain)
-		f.conn.AddRule(dropRule)
+			dropTemplate := createDropRule(table.Filter, chain)
+			existingDrop, err := findRule(f.conn, dropTemplate)
+			if err != nil {
+				return fmt.Errorf("find drop rule: %w", err)
+			}
+			if existingDrop != nil {
+				f.conn.DelRule(existingDrop)
+			}
+
+			for _, prefix := range prefixes {
+				if !prefixMatchesTable(prefix, table.Proto) {
+					continue
+				}
+				if prefix.Addr().Is6() && !f.v6Available {
+					continue
+				}
+				rule, err := createRangeRule(table.Filter, chain, prefix, expr.VerdictAccept)
+				if err != nil {
+					return fmt.Errorf("create bypass rule for %v: %w", prefix, err)
+				}
+				existing, _ := findRule(f.conn, rule)
+				if existing == nil {
+					f.conn.AddRule(rule)
+					f.localAddrRules = append(f.localAddrRules, rule)
+				}
+			}
+
+			dropRule := createDropRule(table.Filter, chain)
+			f.conn.AddRule(dropRule)
+		}
 	}
 
 	if err := f.conn.Flush(); err != nil {
@@ -343,6 +347,13 @@ func (f *LinuxFirewall) RemoveLocalNetworks() error {
 
 func (f *LinuxFirewall) IsAllowLocalNetworksEnabled() bool {
 	return f.localAddrRules != nil
+}
+
+func prefixMatchesTable(prefix netip.Prefix, family nftables.TableFamily) bool {
+	if prefix.Addr().Is4() {
+		return family == nftables.TableFamilyIPv4
+	}
+	return family == nftables.TableFamilyIPv6
 }
 
 func (f *LinuxFirewall) IsEnabled() bool {

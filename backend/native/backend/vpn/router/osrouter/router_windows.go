@@ -127,7 +127,7 @@ func (r *windowsRouter) Set(c *router.Config) error {
 		}
 	}
 
-	if err := r.syncFirewallState(newC, newC.HasDefaultRouteV4(), newC.HasDefaultRouteV6()); err != nil {
+	if err := r.syncFirewallState(newC, familyIsolated(newC, true), familyIsolated(newC, false)); err != nil {
 		return err
 	}
 
@@ -375,6 +375,15 @@ func (r *windowsRouter) configureInterface(cfg *router.Config) error {
 
 	for _, route := range cfg.Routes {
 		if (route.Addr().Is4() && ipif4 == nil) || (route.Addr().Is6() && ipif6 == nil) {
+			continue
+		}
+		// Unsupported family is a /0 with no tun address, or the other family is a
+		// usable full tunnel and this one has no address. Windows has no
+		// blackhole route so the kill switch drops the family, including a
+		// connected prefix that would otherwise beat a /1. A split prefix,
+		// with no /0 on either family, still falls through and may use
+		// dead:beef.
+		if familyUnsupported(cfg, route.Addr().Is4()) {
 			continue
 		}
 

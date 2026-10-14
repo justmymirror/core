@@ -52,6 +52,10 @@ type darwinRouter struct {
 	// of the same dest/netmask, restored when that tun route is removed.
 	displaced map[netip.Prefix]darwinNetRoute
 
+	// blackhole4/6 are the /1 blackhole routes for a family the tun cannot carry.
+	blackhole4 bool
+	blackhole6 bool
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -116,7 +120,15 @@ func (r *darwinRouter) Set(c *router.Config) error {
 	if err := r.applyAddresses(newC); err != nil {
 		return err
 	}
+	// Drop blackholes before tun /1s are added, or route add hits "file exists"
+	// and leaves the blackhole in place.
+	if err := r.deleteUnwantedBlackholes(newC); err != nil {
+		return err
+	}
 	if err := r.applyRoutes(newC, prevC); err != nil {
+		return err
+	}
+	if err := r.installBlackholes(newC); err != nil {
 		return err
 	}
 	if err := r.protectPeerEndpoints(newC); err != nil {
@@ -153,8 +165,8 @@ func (r *darwinRouter) Close() error {
 }
 
 func (r *darwinRouter) syncFirewallState(newC *router.Config) error {
-	requiresKSv4 := newC.HasDefaultRouteV4()
-	requiresKSv6 := newC.HasDefaultRouteV6()
+	requiresKSv4 := familyIsolated(newC, true)
+	requiresKSv6 := familyIsolated(newC, false)
 	requiresKS := requiresKSv4 || requiresKSv6
 
 	if !requiresKS && !r.fw.IsEnabled() {
@@ -235,9 +247,90 @@ func (r *darwinRouter) cleanupPreviousState(newC, prevC *router.Config) {
 	}
 }
 
+// deleteUnwantedBlackholes removes /1 blackholes before tun routes are added.
+func (r *darwinRouter) deleteUnwantedBlackholes(newC *router.Config) error {
+	if !familyUnsupported(newC, true) {
+		if err := r.setBlackhole(true, false); err != nil {
+			return err
+		}
+	}
+	if !familyUnsupported(newC, false) {
+		if err := r.setBlackhole(false, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *darwinRouter) installBlackholes(newC *router.Config) error {
+	if err := r.setBlackhole(true, familyUnsupported(newC, true)); err != nil {
+		return err
+	}
+	want6 := familyUnsupported(newC, false) && r.v6Available
+	return r.setBlackhole(false, want6)
+}
+
+func (r *darwinRouter) setBlackhole(v4 bool, want bool) error {
+	have := r.blackhole4
+	if !v4 {
+		have = r.blackhole6
+	}
+	if want == have {
+		return nil
+	}
+	op := "add"
+	if !want {
+		op = "delete"
+	}
+	for _, p := range splitDefaultRoute(!v4) {
+		if err := r.routeBlackhole(op, p); err != nil {
+			return err
+		}
+	}
+	if v4 {
+		r.blackhole4 = want
+	} else {
+		r.blackhole6 = want
+	}
+	return nil
+}
+
+func (r *darwinRouter) routeBlackhole(op string, p netip.Prefix) error {
+	inet := "inet"
+	if p.Addr().Is6() {
+		inet = "inet6"
+	}
+	args := []string{"-q", "-n", op, "-" + inet, p.Masked().String(), "-blackhole"}
+	cmd := exec.Command("route", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.ToLower(string(out))
+		if op == "delete" && (strings.Contains(msg, "not in table") || strings.Contains(msg, "not exist")) {
+			return nil
+		}
+		if op == "add" && strings.Contains(msg, "file exists") {
+			return nil
+		}
+		return fmt.Errorf("%v: %v (%s)", args, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func (r *darwinRouter) applyRoutes(newC, prevC *router.Config) error {
 	for _, rt := range newC.Routes {
-		if slices.Contains(prevC.Routes, rt) {
+		if familyUnsupported(newC, rt.Addr().Is4()) {
+			// Still in the config, so cleanup will not remove a tun route
+			// installed while this family was usable.
+			if _, ok := r.installed[rt]; ok {
+				_ = r.route("delete", rt, r.iface, false)
+				delete(r.installed, rt)
+				r.restoreDisplaced(rt)
+			}
+			continue
+		}
+		// Present last time only means it is already on the tun when that sync
+		// was allowed to install it.
+		if slices.Contains(prevC.Routes, rt) && !familyUnsupported(prevC, rt.Addr().Is4()) {
 			continue
 		}
 		if rt.Addr().Is6() && !r.v6Available {

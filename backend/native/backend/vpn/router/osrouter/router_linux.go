@@ -181,31 +181,31 @@ func (r *linuxRouter) cleanupPreviousState(link netlink.Link, newC, prevC *route
 	}
 
 	// remove old routes
-	prevV4Full := hasDefault(prevC, true)
-	prevV6Full := hasDefault(prevC, false)
-	newV4Full := hasDefault(newC, true)
-	newV6Full := hasDefault(newC, false)
-
 	for _, rt := range prevC.Routes {
-		if !slices.Contains(newC.Routes, rt) {
-			table := unix.RT_TABLE_MAIN
-			if (rt.Addr().Is4() && prevV4Full) || (rt.Addr().Is6() && prevV6Full) {
-				table = tunnelTableID
-			}
-			dst := prefixToIPNet(rt)
-			route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst, Table: table}
-			_ = netlink.RouteDel(route)
+		oldTable, oldInstalled := installedRoute(prevC, rt)
+		newTable, newInstalled := installedRoute(newC, rt)
+		keep := oldInstalled && newInstalled && slices.Contains(newC.Routes, rt) && oldTable == newTable
+		if keep {
+			continue
 		}
+		if !oldInstalled {
+			continue
+		}
+		dst := prefixToIPNet(rt)
+		route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst, Table: oldTable}
+		_ = netlink.RouteDel(route)
 	}
 
 	// clean up marks
-	if prevV4Full && !newV4Full {
+	if familyIsolated(prevC, true) && !familyIsolated(newC, true) {
 		r.deletePolicyRules(netlink.FAMILY_V4)
 		r.deleteBootstrapPolicyRules(netlink.FAMILY_V4)
+		r.deleteBlackhole(true)
 	}
-	if prevV6Full && !newV6Full {
+	if familyIsolated(prevC, false) && !familyIsolated(newC, false) {
 		r.deletePolicyRules(netlink.FAMILY_V6)
 		r.deleteBootstrapPolicyRules(netlink.FAMILY_V6)
+		r.deleteBlackhole(false)
 	}
 }
 
@@ -252,15 +252,16 @@ func (r *linuxRouter) isUnchanged(newC *router.Config) bool {
 }
 
 func (r *linuxRouter) updatePrevState(newC *router.Config) {
-	r.v4Full = hasDefault(newC, true)
-	r.v6Full = hasDefault(newC, false)
+	r.v4Full = familyUsable(newC, true)
+	r.v6Full = familyUsable(newC, false)
 	r.prevConfig = newC.Clone()
 	log.Debug(tag, "Router state updated: full v4=%v v6=%v", r.v4Full, r.v6Full)
 }
 
 func (r *linuxRouter) syncFirewallState(newC *router.Config) error {
-	requiresKSv4 := newC.HasDefaultRouteV4()
-	requiresKSv6 := newC.HasDefaultRouteV6()
+	// A full tunnel blocks a family the tun cannot carry
+	requiresKSv4 := familyIsolated(newC, true)
+	requiresKSv6 := familyIsolated(newC, false)
 	requiresKS := requiresKSv4 || requiresKSv6
 
 	if !requiresKS && !r.fw.IsEnabled() {
@@ -308,10 +309,10 @@ func (r *linuxRouter) syncDeviceParams(link netlink.Link, newC, prevC *router.Co
 }
 
 func (r *linuxRouter) syncDNS(newC, prevC *router.Config) error {
-	v4Full := hasDefault(newC, true)
-	v6Full := hasDefault(newC, false)
-	prevV4Full := hasDefault(prevC, true)
-	prevV6Full := hasDefault(prevC, false)
+	v4Full := familyUsable(newC, true)
+	v6Full := familyUsable(newC, false)
+	prevV4Full := familyUsable(prevC, true)
+	prevV6Full := familyUsable(prevC, false)
 
 	dnsChanged := !slices.Equal(newC.DNS, prevC.DNS) ||
 		!slices.Equal(newC.SearchDomains, prevC.SearchDomains)
@@ -349,19 +350,17 @@ func (r *linuxRouter) applyNewAddresses(link netlink.Link, newC *router.Config) 
 }
 
 func (r *linuxRouter) syncRoutingAndRules(link netlink.Link, newC *router.Config) error {
-	v4Full := hasDefault(newC, true)
-	v6Full := hasDefault(newC, false)
-
 	families := []int{netlink.FAMILY_V4}
 	if r.v6Available {
 		families = append(families, netlink.FAMILY_V6)
 	}
 
 	for _, fam := range families {
-		isFull := (fam == netlink.FAMILY_V4 && v4Full) || (fam == netlink.FAMILY_V6 && v6Full)
+		v4 := fam == netlink.FAMILY_V4
+		isolated := familyIsolated(newC, v4)
+		usable := familyUsable(newC, v4)
 
-		if isFull {
-			// add unnel rules
+		if isolated {
 			if err := r.addPolicyRules(fam); err != nil {
 				return err
 			}
@@ -371,19 +370,73 @@ func (r *linuxRouter) syncRoutingAndRules(link netlink.Link, newC *router.Config
 			}
 		}
 
-		routes := filterRoutes(newC.Routes, fam == netlink.FAMILY_V4)
-		table := unix.RT_TABLE_MAIN
-		if isFull {
-			table = tunnelTableID
+		if isolated && !usable {
+			// AllowedIPs asked to capture this family, or the other family is a
+			// full tunnel, but the tun has no address here so we blackhole it.
+			if err := r.replaceBlackhole(v4); err != nil {
+				return err
+			}
+			continue
 		}
+		r.deleteBlackhole(v4)
 
+		routes := filterRoutes(newC.Routes, v4)
 		for _, rt := range routes {
+			table, install := installedRoute(newC, rt)
+			if !install {
+				continue
+			}
 			if err := r.replaceRouteIdempotent(link, rt, table); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// installedRoute is where a prefix is programmed. The second result is false
+// when the family is blackholed and the prefix must not be pointed at the tun.
+func installedRoute(c *router.Config, rt netip.Prefix) (table int, ok bool) {
+	v4 := rt.Addr().Is4()
+	if familyUsable(c, v4) {
+		return tunnelTableID, true
+	}
+	if familyIsolated(c, v4) {
+		return 0, false
+	}
+	return unix.RT_TABLE_MAIN, true
+}
+
+func defaultPrefix(v4 bool) netip.Prefix {
+	if v4 {
+		return netip.MustParsePrefix("0.0.0.0/0")
+	}
+	return netip.MustParsePrefix("::/0")
+}
+
+func (r *linuxRouter) replaceBlackhole(v4 bool) error {
+	route := &netlink.Route{
+		Dst:   prefixToIPNet(defaultPrefix(v4)),
+		Table: tunnelTableID,
+		Type:  unix.RTN_BLACKHOLE,
+	}
+	if err := netlink.RouteReplace(route); err != nil {
+		fam := "ipv6"
+		if v4 {
+			fam = "ipv4"
+		}
+		return fmt.Errorf("blackhole %s: %w", fam, err)
+	}
+	return nil
+}
+
+func (r *linuxRouter) deleteBlackhole(v4 bool) {
+	route := &netlink.Route{
+		Dst:   prefixToIPNet(defaultPrefix(v4)),
+		Table: tunnelTableID,
+		Type:  unix.RTN_BLACKHOLE,
+	}
+	_ = netlink.RouteDel(route)
 }
 
 func (r *linuxRouter) addBootstrapPolicyRules(family int) error {
@@ -442,30 +495,6 @@ func (r *linuxRouter) replaceRouteIdempotent(link netlink.Link, rt netip.Prefix,
 		Type:      unix.RTN_UNICAST,
 	}
 	return netlink.RouteReplace(route)
-}
-
-// hasDefault returns true if config has a default route for v4 (true) or v6 (false)
-// and the tunnel interface actually has an address in that family.
-func hasDefault(c *router.Config, v4 bool) bool {
-	if c == nil {
-		return false
-	}
-	hasRoute := false
-	for _, rt := range c.Routes {
-		if rt.Bits() == 0 && ((v4 && rt.Addr().Is4()) || (!v4 && rt.Addr().Is6())) {
-			hasRoute = true
-			break
-		}
-	}
-	if !hasRoute {
-		return false
-	}
-	for _, a := range c.TunnelAddrs {
-		if (v4 && a.Addr().Is4()) || (!v4 && a.Addr().Is6()) {
-			return true
-		}
-	}
-	return false
 }
 
 // filterRoutes returns routes for v4 (true) or v6 (false).

@@ -15,9 +15,10 @@ import (
 
 const knownNetworksPlist = "/Library/Preferences/com.apple.wifi.known-networks.plist"
 
-// currentWifiSSID infers the current Wi-Fi SSID without CoreWLAN/CoreLocation
-// (both gated behind Location Services authorization on modern macOS), using
-// the gateway-correlation technique from https://github.com/fjh658/get-ssid-rs.
+// currentWifiSSID infers the current Wi-Fi SSID from the known-networks plist,
+// using the gateway-correlation technique from https://github.com/fjh658/get-ssid-rs.
+// Modern macOS denies this read to a root daemon. The signed-in app reports the
+// CoreWLAN name, and this read remains the fallback when that report is absent.
 //
 // With an IPv4 gateway (the common case), filters known networks to those
 // whose recorded IPv4NetworkSignature references it, then breaks ties among those candidates by recency

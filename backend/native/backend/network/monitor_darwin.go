@@ -174,13 +174,18 @@ func lookupUnderlay(ctx context.Context, prev NetworkInfo) NetworkInfo {
 		BSSID:         UnknownBSSID,
 	}
 	if info.Type == NetworkWifi {
-		// Only derive SSID on a genuine network change
-		// otherwise reuse the cached value instead
-		if prev.Type == NetworkWifi && prev.InterfaceName == ifName && prev.HasKnownSSID() {
-			info.SSID = prev.SSID
-		} else if ssid := currentWifiSSID(d.Gateway); ssid != "" {
-			info.SSID = ssid
+		prevSSID := ""
+		if prev.Type == NetworkWifi && prev.InterfaceName == ifName {
+			prevSSID = prev.SSID
 		}
+		// CoreWLAN report wins while this interface and
+		// gateway still match. Otherwise keep the cached name, then the plist.
+		observed := getObservedWifi()
+		plistSSID := ""
+		if wifiPlistNeeded(ifName, d.Gateway, prevSSID, observed) {
+			plistSSID = currentWifiSSID(d.Gateway)
+		}
+		info.SSID = ResolveWifiSSID(ifName, d.Gateway, prevSSID, plistSSID, observed)
 	}
 	addrs, _ := iface.Addrs()
 	for _, a := range addrs {

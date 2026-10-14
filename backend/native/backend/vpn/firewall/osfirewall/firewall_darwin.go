@@ -48,6 +48,11 @@ type DarwinFirewall struct {
 	blockedV6 atomic.Bool
 
 	pfToken string
+
+	// virtual NICs passed so a NAT guest can be forwarded into the tun
+	vmIfaces []string
+	// non-nil while the anchor is loaded and the list is being refreshed.
+	vmStop   chan struct{}
 }
 
 func New() (firewall.Firewall, error) {
@@ -155,11 +160,11 @@ func (f *DarwinFirewall) Disable() error {
 }
 
 func (f *DarwinFirewall) reconcileLocked() error {
-	persist := f.persistKillSwitch.Load()
-	wantV4 := f.tunnelReqV4.Load() || persist
-	wantV6 := (f.tunnelReqV6.Load() || persist) && f.v6Available
+	wantV4, wantV6 := f.anchorFamilies()
 
 	if !wantV4 && !wantV6 {
+		f.stopVMWatchLocked()
+		f.vmIfaces = nil
 		if err := f.unloadAnchor(); err != nil {
 			log.Error(tag, "unload pf anchor: %v", err)
 		}
@@ -171,12 +176,16 @@ func (f *DarwinFirewall) reconcileLocked() error {
 	if err := f.ensurePF(); err != nil {
 		return err
 	}
+	prevVM := f.vmIfaces
+	f.vmIfaces = listVMPassIfaces()
 	if err := f.loadAnchor(wantV4, wantV6); err != nil {
+		f.vmIfaces = prevVM
 		return err
 	}
 	f.blockedV4.Store(wantV4)
 	f.blockedV6.Store(wantV6)
-	log.Debug(tag, "pf kill switch active v4=%v v6=%v tun=%s", wantV4, wantV6, f.tunName)
+	f.startVMWatchLocked()
+	log.Debug(tag, "pf kill switch active v4=%v v6=%v tun=%s vm=%v", wantV4, wantV6, f.tunName, f.vmIfaces)
 	return nil
 }
 
@@ -294,6 +303,15 @@ func (f *DarwinFirewall) buildRules(wantV4, wantV6 bool) string {
 	if f.tunName != "" && safeIface(f.tunName) {
 		fmt.Fprintf(&b, "pass quick on %s all\n", f.tunName)
 	}
+	// A NAT guest arrives on a virtual NIC. Passing it lets the host forward
+	// the packet. The block below still drops whatever then tries to leave on
+	// the physical NIC. Bridges that aren't virtual are not in this list.
+	for _, name := range f.vmIfaces {
+		if name == f.tunName || !safeIface(name) {
+			continue
+		}
+		fmt.Fprintf(&b, "pass quick on %s all\n", name)
+	}
 
 	// For tunnel boostrap socket bypass via IP_TOS/IPV6_TCLASS
 	fmt.Fprintf(&b, "pass out quick all tos 0x%02x\n", mark.DarwinBootstrapTOS)
@@ -345,17 +363,4 @@ func (f *DarwinFirewall) passTable() []string {
 		add(p)
 	}
 	return out
-}
-
-func safeIface(name string) bool {
-	if name == "" {
-		return false
-	}
-	for _, c := range name {
-		if !(c == '.' || c == '-' || c == '_' ||
-			(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
-			return false
-		}
-	}
-	return true
 }

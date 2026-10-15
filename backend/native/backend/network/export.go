@@ -110,3 +110,12 @@ func getNetworkInfoJson() *C.char {
 	}
 	return C.CString(infoJSON(m.Current()))
 }
+
+//export setObservedWifiSSID
+func setObservedWifiSSID(ssid *C.char) {
+	reported := ""
+	if ssid != nil {
+		reported = C.GoString(ssid)
+	}
+	applyObservedWifiReport(reported)
+}

@@ -178,14 +178,10 @@ func lookupUnderlay(ctx context.Context, prev NetworkInfo) NetworkInfo {
 		if prev.Type == NetworkWifi && prev.InterfaceName == ifName {
 			prevSSID = prev.SSID
 		}
-		// CoreWLAN report wins while this interface and
-		// gateway still match. Otherwise keep the cached name, then the plist.
+		// A LaunchAgent report that matches this interface and gateway wins.
+		// With no report, keep the cached name for this interface.
 		observed := getObservedWifi()
-		plistSSID := ""
-		if wifiPlistNeeded(ifName, d.Gateway, prevSSID, observed) {
-			plistSSID = currentWifiSSID(d.Gateway)
-		}
-		info.SSID = ResolveWifiSSID(ifName, d.Gateway, prevSSID, plistSSID, observed)
+		info.SSID = ResolveWifiSSID(ifName, d.Gateway, prevSSID, observed)
 	}
 	addrs, _ := iface.Addrs()
 	for _, a := range addrs {

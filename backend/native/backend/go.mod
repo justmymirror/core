@@ -17,7 +17,6 @@ require (
 	golang.org/x/sys v0.47.0
 	golang.zx2c4.com/wireguard/windows v1.0.1
 	gvisor.dev/gvisor v0.0.0-20260224225140-573d5e7127a8
-	howett.net/plist v1.0.1
 )
 
 require (

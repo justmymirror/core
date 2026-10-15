@@ -1,6 +1,7 @@
 //go:build darwin
 
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreLocation/CoreLocation.h>
 #import <CoreWLAN/CoreWLAN.h>
@@ -9,12 +10,14 @@
 #import <stdlib.h>
 #import <string.h>
 
-// CoreWLAN only returns the SSID to a user-session process whose bundle has
-// been granted Location.
+// CoreWLAN only returns the SSID to a user-session process that has created
+// NSApplication and whose bundle has been granted Location. AppKit is
+// weak-linked so the root daemon, which never calls these entry points, does
+// not load it.
 //
-// The agent has no AppKit run loop. It runs this thread's CoreFoundation run
-// loop while waiting, so locationManagerDidChangeAuthorization can fire here
-// when the user grants Location in the app.
+// The agent has no AppKit run loop of its own. It runs this thread's
+// CoreFoundation run loop while waiting, so
+// locationManagerDidChangeAuthorization can fire here when Location is granted.
 
 static CLLocationManager *gManager;
 static id<CLLocationManagerDelegate> gDelegate;
@@ -89,6 +92,26 @@ onMain(void (^block)(void))
 	dispatch_sync(dispatch_get_main_queue(), block);
 }
 
+/* CoreWLAN returns a nil name until this process has created NSApplication. */
+static void
+ensureAppKit(void)
+{
+	[NSApplication sharedApplication];
+}
+
+static void
+activateForPrompt(void)
+{
+	if (@available(macOS 14.0, *)) {
+		[NSApp activate];
+		return;
+	}
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	[NSApp activateIgnoringOtherApps:YES];
+#pragma clang diagnostic pop
+}
+
 static int
 codeForStatus(CLAuthorizationStatus status)
 {
@@ -115,6 +138,7 @@ authorizationOnMain(void)
 	__block int code = -1;
 	onMain(^{
 		CLAuthorizationStatus status;
+		ensureAppKit();
 		ensureManagerOnMain();
 		if (@available(macOS 11.0, *)) {
 			status = gManager.authorizationStatus;
@@ -123,6 +147,22 @@ authorizationOnMain(void)
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 			status = [CLLocationManager authorizationStatus];
 #pragma clang diagnostic pop
+		}
+		/*
+		 * The instance property stays notDetermined until this process
+		 * calls requestAlwaysAuthorization. A grant already recorded in
+		 * System Settings is visible on the class method. macOS 13 still
+		 * has that method. An initial notDetermined callback must not
+		 * cover a later authorized read: callers re-read this function.
+		 */
+		if (status == kCLAuthorizationStatusNotDetermined) {
+			CLAuthorizationStatus recorded;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+			recorded = [CLLocationManager authorizationStatus];
+#pragma clang diagnostic pop
+			if (recorded != kCLAuthorizationStatusNotDetermined)
+				status = recorded;
 		}
 		code = codeForStatus(status);
 	});
@@ -141,12 +181,24 @@ wgtunnel_wifi_authorization(void)
 	return authorizationOnMain();
 }
 
+static void
+requestOnMain(void)
+{
+	ensureAppKit();
+	activateForPrompt();
+	ensureManagerOnMain();
+	[gManager requestAlwaysAuthorization];
+}
+
 void
 wgtunnel_wifi_request_authorization(void)
 {
-	onMain(^{
-		ensureManagerOnMain();
-		[gManager requestAlwaysAuthorization];
+	/*
+	 * Present on a later turn of the main queue. Calling this synchronously
+	 * from the click returns before AppKit will show the panel.
+	 */
+	dispatch_async(dispatch_get_main_queue(), ^{
+		requestOnMain();
 	});
 }
 
@@ -165,6 +217,7 @@ wgtunnel_wifi_wait(double timeoutSeconds)
 	if (![NSThread isMainThread])
 		return 0;
 	ensureWakeSource();
+	ensureAppKit();
 	ensureManagerOnMain();
 	authBefore = atomic_load(&gAuthGen);
 	if (timeoutSeconds >= 0)
@@ -195,29 +248,65 @@ wgtunnel_wifi_wake_wait(void)
 	signalWaiters();
 }
 
+static NSString *
+ssidFromInterface(CWInterface *iface)
+{
+	NSData *data;
+
+	if (iface == nil)
+		return nil;
+	/*
+	 * macOS 15 deprecates the NSString ssid property. Prefer ssidData, and
+	 * keep the string property when that data is empty or not UTF-8.
+	 */
+	if (@available(macOS 15.0, *)) {
+		NSString *decoded;
+		data = iface.ssidData;
+		if (data.length > 0) {
+			decoded = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+			if (decoded.length > 0)
+				return decoded;
+		}
+	}
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	return iface.ssid;
+#pragma clang diagnostic pop
+}
+
 int
 wgtunnel_wifi_associated(void)
 {
-	@autoreleasepool {
-		CWInterface *iface = [[CWWiFiClient sharedWiFiClient] interface];
-		if (iface == nil || !iface.powerOn)
-			return 0;
-		return iface.interfaceMode != kCWInterfaceModeNone;
-	}
+	__block int associated = 0;
+	onMain(^{
+		ensureAppKit();
+		@autoreleasepool {
+			CWInterface *iface = [[CWWiFiClient sharedWiFiClient] interface];
+			if (iface == nil || !iface.powerOn)
+				return;
+			associated = iface.interfaceMode != kCWInterfaceModeNone;
+		}
+	});
+	return associated;
 }
 
 char *
 wgtunnel_wifi_current_ssid(void)
 {
-	@autoreleasepool {
-		CWInterface *iface = [[CWWiFiClient sharedWiFiClient] interface];
-		NSString *ssid = iface.ssid;
-		const char *utf;
-		if (ssid.length == 0)
-			return NULL;
-		utf = ssid.UTF8String;
-		if (utf == NULL)
-			return NULL;
-		return strdup(utf);
-	}
+	__block char *out = NULL;
+	onMain(^{
+		ensureAppKit();
+		@autoreleasepool {
+			CWInterface *iface = [[CWWiFiClient sharedWiFiClient] interface];
+			NSString *ssid = ssidFromInterface(iface);
+			const char *utf;
+			if (ssid.length == 0)
+				return;
+			utf = ssid.UTF8String;
+			if (utf == NULL)
+				return;
+			out = strdup(utf);
+		}
+	});
+	return out;
 }

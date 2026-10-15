@@ -3,7 +3,7 @@
 package jni
 
 /*
-#cgo LDFLAGS: -framework Foundation -framework CoreFoundation -framework CoreLocation -framework CoreWLAN
+#cgo LDFLAGS: -framework Foundation -framework CoreFoundation -framework CoreLocation -framework CoreWLAN -weak_framework AppKit
 */
 import "C"
 

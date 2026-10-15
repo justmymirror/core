@@ -41,9 +41,10 @@ func getObservedWifi() *ObservedWifi {
 // A report that matches this interface and gateway wins, including an empty
 // report that clears the name. A report for a different underlay is ignored
 // and the previous name is not reused, so joining another network cannot keep
-// the last one. With no report at all, prevSSID is the existing cache and
-// plistSSID is the known-networks fallback.
-func ResolveWifiSSID(ifName, gateway, prevSSID, plistSSID string, observed *ObservedWifi) string {
+// the last one. With no report at all, a known prevSSID is the cache. The
+// daemon does not read a file for the name. The LaunchAgent is the only
+// source of a new one.
+func ResolveWifiSSID(ifName, gateway, prevSSID string, observed *ObservedWifi) string {
 	if observed != nil && observed.IfName == ifName && observed.Gateway == gateway {
 		if observed.SSID != "" {
 			return observed.SSID
@@ -51,28 +52,10 @@ func ResolveWifiSSID(ifName, gateway, prevSSID, plistSSID string, observed *Obse
 		return UnknownSSID
 	}
 	if observed != nil {
-		if plistSSID != "" {
-			return plistSSID
-		}
 		return UnknownSSID
 	}
 	if prevSSID != "" && prevSSID != UnknownSSID {
 		return prevSSID
 	}
-	if plistSSID != "" {
-		return plistSSID
-	}
 	return UnknownSSID
-}
-
-// wifiPlistNeeded reports whether the known-networks file has to be read.
-// A matching app report already decided the name, so the file is left alone.
-func wifiPlistNeeded(ifName, gateway, prevSSID string, observed *ObservedWifi) bool {
-	if observed != nil && observed.IfName == ifName && observed.Gateway == gateway {
-		return false
-	}
-	if observed != nil {
-		return true
-	}
-	return prevSSID == "" || prevSSID == UnknownSSID
 }

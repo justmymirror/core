@@ -101,9 +101,10 @@ codeForStatus(CLAuthorizationStatus status)
 		return 2;
 	case kCLAuthorizationStatusAuthorizedAlways:
 		return 3;
-	case kCLAuthorizationStatusAuthorizedWhenInUse:
-		return 4;
 	default:
+		/*
+		 * kCLAuthorizationStatusAuthorizedWhenInUse is iOS only
+		 */
 		return -1;
 	}
 }

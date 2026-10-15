@@ -37,6 +37,12 @@ endif
 
 DESKTOP_CGO_CFLAGS := $(JDK_JNI_CFLAGS) $(JNI_INCLUDES)
 
+# Every build target below only listed $(GO_DIR)/.prepared (the toolchain extraction
+# marker) as a prerequisite, so a pre-existing $(DESTDIR)/libwg-*.{dylib,so,dll} left
+# over from an earlier checkout (out/ isn't cleaned by git) was never considered stale
+# and silently kept being reused, even after Go/cgo sources changed underneath it.
+GO_SOURCES := $(shell find $(CURDIR) \( -name '*.go' -o -name '*.c' -o -name '*.m' -o -name '*.h' -o -name 'go.mod' -o -name 'go.sum' \) -not -path '$(BUILDDIR)/*' -not -path '$(DESTDIR)/*')
+
 NDK_GO_ARCH_MAP_x86 := 386
 NDK_GO_ARCH_MAP_x86_64 := amd64
 NDK_GO_ARCH_MAP_amd64 := amd64
@@ -88,7 +94,7 @@ $(GO_DIR)/.prepared: $(GRADLE_USER_HOME)/caches/golang/$(GO_TARBALL) \
 	find "$(dir $@)pkg" -mindepth 1 -maxdepth 1 -type d -name "linux_*" -exec rm -rf {} +; \
 	touch "$@"'
 
-$(DESTDIR)/libam-go.so: $(GO_DIR)/.prepared
+$(DESTDIR)/libam-go.so: $(GO_DIR)/.prepared $(GO_SOURCES)
 	@mkdir -p "$(DESTDIR)"
 	@test -n "$(ANDROID_ARCH_NAME)" || (echo "ANDROID_ARCH_NAME required"; exit 1)
 	@test -n "$(ANDROID_PACKAGE_NAME)" || (echo "ANDROID_PACKAGE_NAME required"; exit 1)
@@ -107,7 +113,7 @@ $(DESTDIR)/libam-go.so: $(GO_DIR)/.prepared
 		-o "$@" -buildmode=c-shared .
 
 
-$(DESTDIR)/libwg-linux-amd64.so: $(GO_DIR)/.prepared
+$(DESTDIR)/libwg-linux-amd64.so: $(GO_DIR)/.prepared $(GO_SOURCES)
 	@mkdir -p "$(DESTDIR)"
 	@test -f "$(JAVA_HOME)/include/jni.h" || (echo "jni.h not found; JAVA_HOME=$(JAVA_HOME)"; exit 1)
 	@test -f "$(JAVA_HOME)/include/linux/jni_md.h" || (echo "linux/jni_md.h not found"; exit 1)
@@ -119,7 +125,7 @@ $(DESTDIR)/libwg-linux-amd64.so: $(GO_DIR)/.prepared
 
 # -Wl,--export-all-symbols required for Windows to fix UnsatisfiedLinkError
 ifeq ($(OS),Windows_NT)
-$(DESTDIR)/libwg-windows-amd64.dll:
+$(DESTDIR)/libwg-windows-amd64.dll: $(GO_SOURCES)
 	@mkdir -p "$(DESTDIR)"
 	CGO_ENABLED=1 CGO_CFLAGS='$(DESKTOP_CGO_CFLAGS)' \
 	CGO_LDFLAGS="-Wl,--export-all-symbols" \
@@ -128,7 +134,7 @@ $(DESTDIR)/libwg-windows-amd64.dll:
 	go build -tags 'notest,cgo' -ldflags="-buildid=" -trimpath -buildvcs=false \
 		-o "$@" -buildmode=c-shared .
 else
-$(DESTDIR)/libwg-windows-amd64.dll: $(GO_DIR)/.prepared
+$(DESTDIR)/libwg-windows-amd64.dll: $(GO_DIR)/.prepared $(GO_SOURCES)
 	@mkdir -p "$(DESTDIR)"
 	$(PATCHED_GO) \
 	CGO_ENABLED=1 CGO_CFLAGS='$(DESKTOP_CGO_CFLAGS)' \
@@ -139,7 +145,7 @@ $(DESTDIR)/libwg-windows-amd64.dll: $(GO_DIR)/.prepared
 		-o "$@" -buildmode=c-shared .
 endif
 
-$(DESTDIR)/libwg-darwin-amd64.dylib: $(GO_DIR)/.prepared
+$(DESTDIR)/libwg-darwin-amd64.dylib: $(GO_DIR)/.prepared $(GO_SOURCES)
 	@mkdir -p "$(DESTDIR)"
 	$(PATCHED_GO) \
 	CGO_ENABLED=1 CGO_CFLAGS='$(DESKTOP_CGO_CFLAGS)' \
@@ -147,7 +153,7 @@ $(DESTDIR)/libwg-darwin-amd64.dylib: $(GO_DIR)/.prepared
 	go build -tags 'notest,cgo' -ldflags="-buildid=" -trimpath -buildvcs=false \
 		-o "$@" -buildmode=c-shared .
 
-$(DESTDIR)/libwg-darwin-arm64.dylib: $(GO_DIR)/.prepared
+$(DESTDIR)/libwg-darwin-arm64.dylib: $(GO_DIR)/.prepared $(GO_SOURCES)
 	@mkdir -p "$(DESTDIR)"
 	$(PATCHED_GO) \
 	CGO_ENABLED=1 CGO_CFLAGS='$(DESKTOP_CGO_CFLAGS)' \

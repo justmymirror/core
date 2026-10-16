@@ -8,6 +8,8 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.TrafficStats
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.system.OsConstants
@@ -35,6 +37,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -62,6 +65,9 @@ internal class VpnService : android.net.VpnService(), SocketProtector, VpnRuntim
     @Volatile private var staleVpnNetwork: Network? = null
     private var vpnNetworkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var vpnNetworkDeferred: CompletableDeferred<Network>? = null
+    @Volatile private var vpnAttemptGeneration = 0
+    private var vpnNetworkPollJob: Job? = null
+    @Volatile private var loggedHandleFailure = false
 
     @Volatile internal var currentKillSwitchConfig: KillSwitchConfig? = null
 
@@ -221,7 +227,11 @@ internal class VpnService : android.net.VpnService(), SocketProtector, VpnRuntim
         hevBridgeFd = null
         currentKillSwitchConfig = null
         isKillSwitchActive = false
-        if (vpnTunFd == null) UnderlayDnsBridge.setVpnNetwork(null)
+        if (vpnTunFd == null) {
+            stopVpnNetworkPoll()
+            ourVpnNetwork = null
+            UnderlayDnsBridge.setVpnNetwork(null)
+        }
     }
 
     suspend fun setKillSwitch(config: KillSwitchConfig?) {
@@ -374,33 +384,27 @@ internal class VpnService : android.net.VpnService(), SocketProtector, VpnRuntim
         awaitOurVpnNetwork()
     }
 
-    // establish only returns a TUN fd. The Network (for getNetworkHandle()) is published
-    // async, and split-tunnel VPNs are never the default network, so we watch TRANSPORT_VPN
-    // instead of getActiveNetwork(). onAvailable soft-checks owner UID (see isLikelyOurs) to
-    // avoid binding to a different VPN (e.g. VpnManager/IKEv2), and skips staleVpnNetwork from
-    // beginVpnNetworkAttempt. Synchronized with onAvailable/onLost so register/unregister can't
-    // race callback delivery, and so a second call here can't leak a duplicate registration.
+    // The VPN Network (for getNetworkHandle()) is published async, and a split-tunnel VPN is never
+    // the default network. The request below only requires TRANSPORT_VPN. On Android 12+ it also includes networks
+    // that do not apply to this UID. Below that there is no public API for the UID scope, so
+    // allNetworks is polled instead. Those OEMs also drop the callback.
+    // onAvailable soft-checks owner UID (see isLikelyOurs) to avoid binding to a different
+    // VPN, and skips staleVpnNetwork from beginVpnNetworkAttempt.
     @Synchronized
     private fun ensureVpnNetworkCallback() {
         if (vpnNetworkCallback != null) return
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
-        val request =
-            NetworkRequest.Builder()
-                .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
-                .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-                .build()
         val cb =
             object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    synchronized(this@VpnService) {
-                        // Ignore a replaced/torn-down callback, or a queued event for the
-                        // network beginVpnNetworkAttempt just invalidated.
-                        if (vpnNetworkCallback !== this) return
-                        if (network == staleVpnNetwork) return
-                        if (!isLikelyOurs(network)) return
-                        applyVpnNetwork(network)
-                        vpnNetworkDeferred?.complete(network)
-                    }
+                    considerVpnNetwork(network, "callback")
+                }
+
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    networkCapabilities: NetworkCapabilities,
+                ) {
+                    considerVpnNetwork(network, "callback")
                 }
 
                 override fun onLost(network: Network) {
@@ -413,8 +417,58 @@ internal class VpnService : android.net.VpnService(), SocketProtector, VpnRuntim
                     }
                 }
             }
-        cm.registerNetworkCallback(request, cb)
+        val handler = Handler(Looper.getMainLooper())
+        try {
+            cm.registerNetworkCallback(vpnNetworkRequest(), cb, handler)
+        } catch (e: SecurityException) {
+            // setIncludeOtherUidNetworks is rejected on some builds. The allNetworks poll
+            // still covers a split tunnel the narrower request cannot see.
+            log.w(e) { "VPN network callback rejected; retrying without other UID networks" }
+            cm.registerNetworkCallback(
+                NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
+                    .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                    .build(),
+                cb,
+                handler,
+            )
+        }
         vpnNetworkCallback = cb
+    }
+
+    // Only TRANSPORT_VPN is required. Default capabilities hide a split tunnel that is not
+    // INTERNET, TRUSTED, or NOT_RESTRICTED. clearCapabilities() is public on Android 12+.
+    // Older releases only expose removeCapability for the defaults Builder() installs.
+    private fun vpnNetworkRequest(): NetworkRequest {
+        val builder = NetworkRequest.Builder()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.clearCapabilities()
+            builder.addTransportType(NetworkCapabilities.TRANSPORT_VPN)
+            runCatching { builder.setIncludeOtherUidNetworks(true) }
+                .onFailure { e -> log.w(e) { "VPN request cannot include other UID networks" } }
+        } else {
+            builder
+                .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_TRUSTED)
+        }
+        return builder.build()
+    }
+
+    private fun considerVpnNetwork(network: Network, source: String) {
+        synchronized(this) {
+            if (vpnNetworkCallback == null) return
+            if (network == staleVpnNetwork) return
+            if (!isLikelyOurs(network)) return
+            val handle = vpnNetworkHandle(network)
+            if (handle == 0L) return
+            if (ourVpnNetwork == network) return
+            applyVpnNetwork(network, handle, source)
+            val pending = vpnNetworkDeferred
+            if (pending != null && !pending.isCompleted) pending.complete(network)
+        }
     }
 
     private fun isLikelyOurs(network: Network): Boolean {
@@ -427,8 +481,35 @@ internal class VpnService : android.net.VpnService(), SocketProtector, VpnRuntim
         return ownerUid == Process.myUid()
     }
 
+    // Skip the network beginVpnNetworkAttempt just invalidated. A reconnect can briefly list
+    // both the old and new VPN here, and nothing else distinguishes them.
+    @Suppress("DEPRECATION")
+    private fun findOurVpnNetwork(): Network? {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return null
+        return cm.allNetworks.firstOrNull { network ->
+            if (network == staleVpnNetwork) return@firstOrNull false
+            val caps = cm.getNetworkCapabilities(network) ?: return@firstOrNull false
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                isLikelyOurs(network) &&
+                vpnNetworkHandle(network) != 0L
+        }
+    }
+
+    private fun vpnNetworkHandle(network: Network): Long {
+        return try {
+            network.networkHandle
+        } catch (e: Throwable) {
+            if (!loggedHandleFailure) {
+                loggedHandleFailure = true
+                log.w(e) { "getNetworkHandle failed" }
+            }
+            0L
+        }
+    }
+
     @Synchronized
     private fun unregisterVpnNetworkCallback() {
+        stopVpnNetworkPoll()
         vpnNetworkCallback?.let { cb ->
             try {
                 getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
@@ -440,18 +521,20 @@ internal class VpnService : android.net.VpnService(), SocketProtector, VpnRuntim
         UnderlayDnsBridge.setVpnNetwork(null)
     }
 
-    private fun applyVpnNetwork(network: Network) {
+    private fun applyVpnNetwork(network: Network, handle: Long, source: String) {
         ourVpnNetwork = network
         UnderlayDnsBridge.setVpnNetwork(network)
-        log.d { "VPN network handle=${network.networkHandle}" }
+        log.d { "VPN network handle=$handle ($source)" }
     }
 
     // Call before a new establish() (fresh tunnel, switch, or KS TUN replace). Clears the handle
-    // and remembers it as staleVpnNetwork so a late onAvailable for the old network
-    // can't complete this attempt's deferred. cm.allNetworks isn't used here since it can
-    // briefly list both networks during a reconnect with no way to tell them apart.
+    // and remembers it as staleVpnNetwork so a late event for the old network can't complete
+    // this attempt's deferred.
     @Synchronized
     private fun beginVpnNetworkAttempt() {
+        stopVpnNetworkPoll()
+        vpnAttemptGeneration++
+        loggedHandleFailure = false
         staleVpnNetwork = ourVpnNetwork
         ourVpnNetwork = null
         UnderlayDnsBridge.setVpnNetwork(null)
@@ -460,12 +543,50 @@ internal class VpnService : android.net.VpnService(), SocketProtector, VpnRuntim
 
     private suspend fun awaitOurVpnNetwork() {
         val pending = vpnNetworkDeferred ?: return
+        val generation = vpnAttemptGeneration
+        startVpnNetworkPoll(generation)
         val network = withTimeoutOrNull(3.seconds) { pending.await() }
         if (network == null) {
-            log.w {
-                "VPN Network not published within timeout; FakeDNS will black-hole until it is"
-            }
+            log.w { "VPN network not published within 3s; DNS stays black-holed until it is" }
         }
+    }
+
+    private fun startVpnNetworkPoll(generation: Int) {
+        val job =
+            serviceScope.launch {
+                var elapsed = 0
+                while (isActive && generation == vpnAttemptGeneration && ourVpnNetwork == null) {
+                    findOurVpnNetwork()?.let { considerVpnNetwork(it, "allNetworks") }
+                    if (ourVpnNetwork != null || generation != vpnAttemptGeneration) return@launch
+                    val step =
+                        when {
+                            elapsed < 3_000 -> 150
+                            elapsed < 20_000 -> 500
+                            else -> 2_000
+                        }
+                    delay(step.milliseconds)
+                    elapsed += step
+                    if (elapsed >= 60_000) {
+                        log.w {
+                            "VPN network still missing after ${elapsed}ms; DNS stays black-holed"
+                        }
+                        return@launch
+                    }
+                }
+            }
+        synchronized(this) {
+            if (generation != vpnAttemptGeneration) {
+                job.cancel()
+                return
+            }
+            vpnNetworkPollJob?.cancel()
+            vpnNetworkPollJob = job
+        }
+    }
+
+    private fun stopVpnNetworkPoll() {
+        vpnNetworkPollJob?.cancel()
+        vpnNetworkPollJob = null
     }
 
     override fun detachVpnTunnelFd(): Int? {
@@ -479,7 +600,11 @@ internal class VpnService : android.net.VpnService(), SocketProtector, VpnRuntim
             log.e(throwable = e) { "Failed to close VPN fd" }
         }
         vpnTunFd = null
-        if (hevBridgeFd == null) UnderlayDnsBridge.setVpnNetwork(null)
+        if (hevBridgeFd == null) {
+            stopVpnNetworkPoll()
+            ourVpnNetwork = null
+            UnderlayDnsBridge.setVpnNetwork(null)
+        }
     }
 
     override fun startHevSocks5Bridge(port: Int, password: String) {

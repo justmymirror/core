@@ -37,6 +37,10 @@ endif
 
 DESKTOP_CGO_CFLAGS := $(JDK_JNI_CFLAGS) $(JNI_INCLUDES)
 
+# Go's cgo allowlist accepts -framework and rejects -weak_framework.
+# The Wi-Fi reader weak-links AppKit so the root daemon does not load it.
+DARWIN_CGO_LDFLAGS_ALLOW := ^(-weak_framework|AppKit)$$
+
 # Every build target below only listed $(GO_DIR)/.prepared (the toolchain extraction
 # marker) as a prerequisite, so a pre-existing $(DESTDIR)/libwg-*.{dylib,so,dll} left
 # over from an earlier checkout (out/ isn't cleaned by git) was never considered stale
@@ -149,6 +153,7 @@ $(DESTDIR)/libwg-darwin-amd64.dylib: $(GO_DIR)/.prepared $(GO_SOURCES)
 	@mkdir -p "$(DESTDIR)"
 	$(PATCHED_GO) \
 	CGO_ENABLED=1 CGO_CFLAGS='$(DESKTOP_CGO_CFLAGS)' \
+	CGO_LDFLAGS_ALLOW='$(DARWIN_CGO_LDFLAGS_ALLOW)' \
 	GOOS=darwin GOARCH=amd64 \
 	go build -tags 'notest,cgo' -ldflags="-buildid=" -trimpath -buildvcs=false \
 		-o "$@" -buildmode=c-shared .
@@ -157,6 +162,7 @@ $(DESTDIR)/libwg-darwin-arm64.dylib: $(GO_DIR)/.prepared $(GO_SOURCES)
 	@mkdir -p "$(DESTDIR)"
 	$(PATCHED_GO) \
 	CGO_ENABLED=1 CGO_CFLAGS='$(DESKTOP_CGO_CFLAGS)' \
+	CGO_LDFLAGS_ALLOW='$(DARWIN_CGO_LDFLAGS_ALLOW)' \
 	GOOS=darwin GOARCH=arm64 \
 	go build -tags 'notest,cgo' -ldflags="-buildid=" -trimpath -buildvcs=false \
 		-o "$@" -buildmode=c-shared .

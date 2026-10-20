@@ -108,7 +108,12 @@ object DnsValidator {
     }
 
     private fun validateHostPort(value: String, defaultPort: Int): Result {
-        val (rawHost, rawPort) = TunnelDnsConfig.splitHostPort(value) ?: (value to null)
+        val (rawHost, rawPort) =
+            if (value.contains("://")) {
+                schemeStrippedHostPort(value) ?: return Result.Invalid(DnsValidationError.InvalidUrl)
+            } else {
+                TunnelDnsConfig.splitHostPort(value) ?: (value to null)
+            }
         val host = rawHost.trim()
         val port = rawPort ?: defaultPort
 
@@ -133,6 +138,17 @@ object DnsValidator {
     }
 
     private fun normalizeHostPort(value: String, defaultPort: Int): String {
+        if (value.contains("://")) {
+            // Looks like a DoH URL pasted into a DoT/plain field. Recover the intended
+            // host[:port] instead of mistaking the scheme's colon for a port separator
+            val (host, port) = schemeStrippedHostPort(value) ?: return value
+            val effectivePort = port ?: defaultPort
+            return if (host.contains(":") && !host.startsWith("[")) {
+                "[$host]:$effectivePort"
+            } else {
+                "$host:$effectivePort"
+            }
+        }
         val (host, port) = TunnelDnsConfig.splitHostPort(value) ?: (value to null)
         if (port != null) return value
         val trimmedHost = host.trim()
@@ -142,6 +158,16 @@ object DnsValidator {
         } else {
             "$trimmedHost:$defaultPort"
         }
+    }
+
+    // Recovers host[:port] from a value that still has a URL scheme. Returns null when it has a
+    // real path beyond "/", since that's a sign the endpoint is actually meant for DoH,
+    private fun schemeStrippedHostPort(value: String): Pair<String, Int?>? {
+        val path = UrlParse.pathAndQuery(value, "")
+        if (path.isNotEmpty() && path != "/") return null
+        val host = UrlParse.host(value) ?: return null
+        val port = UrlParse.port(value).takeIf { it > 0 }
+        return host to port
     }
 
     private fun isValidHostOrIp(value: String): Boolean {

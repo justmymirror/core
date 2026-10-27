@@ -385,7 +385,8 @@ internal class VpnService : android.net.VpnService(), SocketProtector, VpnRuntim
     }
 
     // The VPN Network (for getNetworkHandle()) is published async, and a split-tunnel VPN is never
-    // the default network. The request below only requires TRANSPORT_VPN. On Android 12+ it also includes networks
+    // the default network. The request below only requires TRANSPORT_VPN. On Android 12+ it also
+    // includes networks
     // that do not apply to this UID. Below that there is no public API for the UID scope, so
     // allNetworks is polled instead. Those OEMs also drop the callback.
     // onAvailable soft-checks owner UID (see isLikelyOurs) to avoid binding to a different
@@ -552,28 +553,25 @@ internal class VpnService : android.net.VpnService(), SocketProtector, VpnRuntim
     }
 
     private fun startVpnNetworkPoll(generation: Int) {
-        val job =
-            serviceScope.launch {
-                var elapsed = 0
-                while (isActive && generation == vpnAttemptGeneration && ourVpnNetwork == null) {
-                    findOurVpnNetwork()?.let { considerVpnNetwork(it, "allNetworks") }
-                    if (ourVpnNetwork != null || generation != vpnAttemptGeneration) return@launch
-                    val step =
-                        when {
-                            elapsed < 3_000 -> 150
-                            elapsed < 20_000 -> 500
-                            else -> 2_000
-                        }
-                    delay(step.milliseconds)
-                    elapsed += step
-                    if (elapsed >= 60_000) {
-                        log.w {
-                            "VPN network still missing after ${elapsed}ms; DNS stays black-holed"
-                        }
-                        return@launch
+        val job = serviceScope.launch {
+            var elapsed = 0
+            while (isActive && generation == vpnAttemptGeneration && ourVpnNetwork == null) {
+                findOurVpnNetwork()?.let { considerVpnNetwork(it, "allNetworks") }
+                if (ourVpnNetwork != null || generation != vpnAttemptGeneration) return@launch
+                val step =
+                    when {
+                        elapsed < 3_000 -> 150
+                        elapsed < 20_000 -> 500
+                        else -> 2_000
                     }
+                delay(step.milliseconds)
+                elapsed += step
+                if (elapsed >= 60_000) {
+                    log.w { "VPN network still missing after ${elapsed}ms; DNS stays black-holed" }
+                    return@launch
                 }
             }
+        }
         synchronized(this) {
             if (generation != vpnAttemptGeneration) {
                 job.cancel()

@@ -71,6 +71,8 @@ interface Tunnel {
          *   not repeated until the network changes.
          * @param ipv4Fallback runs once per network when the tunnel is unhealthy and peers are on
          *   IPv6, forcing a switch to IPv4 endpoints.
+         * @param ipv6Fallback runs once per failure episode when IPv4 peers still fail after the
+         *   IPv4 attempts, trying their AAAA records and restoring IPv4 if IPv6 does not answer.
          * @param bounceDelaySeconds wait after HandshakeFailure before a full bounce.
          */
         data class Recovery(
@@ -78,6 +80,7 @@ interface Tunnel {
             val dynamicDnsRecovery: Boolean,
             internal val ipv4Fallback: Boolean = false,
             internal val ipv6Recovery: Boolean = false,
+            internal val ipv6Fallback: Boolean = false,
             val bounceDelaySeconds: Int = 30,
         ) : Feature
     }

@@ -110,7 +110,8 @@ object DnsValidator {
     private fun validateHostPort(value: String, defaultPort: Int): Result {
         val (rawHost, rawPort) =
             if (value.contains("://")) {
-                schemeStrippedHostPort(value) ?: return Result.Invalid(DnsValidationError.InvalidUrl)
+                schemeStrippedHostPort(value)
+                    ?: return Result.Invalid(DnsValidationError.InvalidUrl)
             } else {
                 TunnelDnsConfig.splitHostPort(value) ?: (value to null)
             }

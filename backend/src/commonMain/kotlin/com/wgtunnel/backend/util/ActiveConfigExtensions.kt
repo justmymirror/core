@@ -1,6 +1,7 @@
 package com.wgtunnel.backend.util
 
 import com.wgtunnel.backend.enums.FamilyOverride
+import com.wgtunnel.backend.enums.Ipv6Support
 import com.wgtunnel.backend.model.dns.DnsBootstrapResult
 import com.wgtunnel.backend.model.dns.ResolvedHost
 import com.wgtunnel.parser.ActiveConfig
@@ -8,7 +9,7 @@ import com.wgtunnel.parser.ActiveConfig
 internal fun ActiveConfig.findEndpointMismatches(
     freshDns: Map<PublicKey, DnsBootstrapResult>,
     familyOverride: FamilyOverride = FamilyOverride.MatchCurrent,
-    networkHasIpv6: Boolean = true,
+    networkIpv6: Ipv6Support = Ipv6Support.Available,
 ): Map<PublicKey, ResolvedHost> {
     val currentByKey = peers.associateBy { it.publicKey }
     return freshDns
@@ -29,7 +30,7 @@ internal fun ActiveConfig.findEndpointMismatches(
 
             // Normal path
             val freshHost =
-                dns.selectHostForPeer(current.endpoint, familyOverride, networkHasIpv6)
+                dns.selectHostForPeer(current.endpoint, familyOverride, networkIpv6)
                     ?: return@mapNotNull null
             if (freshHost != currentHost) {
                 pubKey to ResolvedHost(host = freshHost)
@@ -42,4 +43,8 @@ internal fun ActiveConfig.findEndpointMismatches(
 
 fun ActiveConfig.hasIpv6Peers(): Boolean {
     return this.peers.any { it.endpoint?.contains("[") == true }
+}
+
+internal fun ActiveConfig.hasIpv4Peers(): Boolean {
+    return this.peers.any { it.endpoint != null && it.endpoint?.contains("[") == false }
 }

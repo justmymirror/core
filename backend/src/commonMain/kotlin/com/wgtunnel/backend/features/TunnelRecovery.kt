@@ -3,6 +3,7 @@ package com.wgtunnel.backend.features
 import co.touchlab.kermit.Logger
 import com.wgtunnel.backend.Tunnel
 import com.wgtunnel.backend.enums.FamilyOverride
+import com.wgtunnel.backend.enums.Ipv6Support
 import com.wgtunnel.backend.event.TunnelEvent
 import com.wgtunnel.backend.model.BackendMode
 import com.wgtunnel.backend.model.dns.BootstrapResolution
@@ -10,8 +11,11 @@ import com.wgtunnel.backend.model.dns.DnsBootstrapResult
 import com.wgtunnel.backend.state.ActiveTunnel
 import com.wgtunnel.backend.util.PublicKey
 import com.wgtunnel.backend.util.buildResolvedPeers
+import com.wgtunnel.backend.util.ddnsRecoveryFamily
 import com.wgtunnel.backend.util.findEndpointMismatches
+import com.wgtunnel.backend.util.hasIpv4Peers
 import com.wgtunnel.backend.util.hasIpv6Peers
+import com.wgtunnel.backend.util.withEndpointsFrom
 import com.wgtunnel.parser.ActiveConfig
 import com.wgtunnel.parser.PeerSection
 import kotlin.concurrent.atomics.AtomicInt
@@ -76,7 +80,7 @@ internal class TunnelRecovery(
         val transportHealthy: Boolean,
         val bootstrapPending: Boolean,
         val lastResolvedPeers: Map<PublicKey, DnsBootstrapResult>?,
-        val networkHasIpv6: Boolean,
+        val networkIpv6: Ipv6Support,
         val activeNetworkKey: String?,
         val deviceAwake: Boolean,
         // Goes up on every wake signal, screen on, unlock, leaving Doze, resume from sleep
@@ -132,7 +136,7 @@ internal class TunnelRecovery(
                                 transportHealthy = false,
                                 bootstrapPending = false,
                                 lastResolvedPeers = null,
-                                networkHasIpv6 = false,
+                                networkIpv6 = Ipv6Support.Unknown,
                                 activeNetworkKey = null,
                                 deviceAwake = false,
                             ),
@@ -150,6 +154,7 @@ internal class TunnelRecovery(
                                 "ddns=${rec.dynamicDnsRecovery} " +
                                 "ipv4Fallback=${rec.ipv4Fallback} " +
                                 "ipv6=${rec.ipv6Recovery} " +
+                                "ipv6Fallback=${rec.ipv6Fallback} " +
                                 "bounceDelay=${rec.bounceDelaySeconds}s"
                         }
                     }
@@ -161,9 +166,22 @@ internal class TunnelRecovery(
             var lastBounce: TimeMark? = null
             // The first bounce after a wake or network change waits only a short settle
             var fastSettle = false
+            // One IPv6 fallback per episode
+            var ipv6FallbackTried = false
             var seenSignals = signals.load()
 
             fun changedSince(): Boolean = signals.load() != seenSignals
+
+            // Only peers on IPv4 are candidates. A peer already on IPv6 leaves the episode
+            // unlatched, so a later fallback to a dead A record gets an IPv6 try.
+            suspend fun willTryIpv6(snap: Snapshot): Boolean =
+                snap.recovery.ipv6Fallback &&
+                    !ipv6FallbackTried &&
+                    snap.networkIpv6 == Ipv6Support.Available &&
+                    snap.activeNetworkKey != null &&
+                    // IPv6 already failed here and fell back to IPv4
+                    snap.activeNetworkKey != lastIpv4FallbackNetworkKey.load() &&
+                    host.getActiveConfig()?.hasIpv4Peers() == true
 
             // A wake, unlock or new network makes earlier attempts stale, so the budget refills.
             fun refreshBudget() {
@@ -177,6 +195,7 @@ internal class TunnelRecovery(
                 }
                 seamlessRecoveryAttempted = 0
                 exhausted = false
+                ipv6FallbackTried = false
                 // Only a signal from the last minute earns the short settle
                 fastSettle =
                     lastSignal.load()?.let { it.elapsedNow() < FRESH_SIGNAL_WINDOW } == true
@@ -194,15 +213,17 @@ internal class TunnelRecovery(
                 return LoopStep.PROCEED
             }
 
-            // DDNS re-resolution and/or a light IPv4 fallback, each behind its own stabilize
-            // window.
+            // DDNS re-resolution, a light IPv4 fallback and a light IPv6 fallback, each behind its
+            // own stabilize window. IPv6 goes last so IPv4 has had its fresh DNS attempt first.
             suspend fun attemptDdnsAndIpv4Fallback(): LoopStep {
                 val rec = snapshots.value.recovery
                 val willTryIpv4 =
                     rec.ipv4Fallback &&
                         snapshots.value.activeNetworkKey != null &&
                         snapshots.value.activeNetworkKey != lastIpv4FallbackNetworkKey.load()
-                if (!(rec.dynamicDnsRecovery || willTryIpv4)) return LoopStep.PROCEED
+                if (!(rec.dynamicDnsRecovery || willTryIpv4 || willTryIpv6(snapshots.value))) {
+                    return LoopStep.PROCEED
+                }
 
                 delay(stabilizeWindow)
                 refreshBudget()
@@ -232,6 +253,32 @@ internal class TunnelRecovery(
                         return LoopStep.BREAK_EPISODE
                     }
                     if (snapshots.value.bootstrapPending) return LoopStep.CONTINUE_EPISODE
+                }
+
+                if (willTryIpv6(snapshots.value)) {
+                    when (val result = tryLightIpv6Fallback(snapshots.value)) {
+                        Ipv6FallbackResult.NotChecked -> Unit
+                        Ipv6FallbackResult.NoIpv6Host -> ipv6FallbackTried = true
+                        is Ipv6FallbackResult.Switched -> {
+                            ipv6FallbackTried = true
+                            // A completed handshake ends the episode, so this returns early
+                            withTimeoutOrNull(stabilizeWindow) {
+                                snapshots.first { !it.shouldKeepFailureRecoveryEpisode }
+                            }
+                            if (!snapshots.value.transportHealthy) {
+                                log.i {
+                                    "Ipv6 Fallback: no handshake over IPv6, restoring previous " +
+                                        "endpoints for tunnel $tunnelId"
+                                }
+                                host.updatePeers(result.previousPeers)
+                            }
+                            refreshBudget()
+                            if (!snapshots.value.shouldKeepFailureRecoveryEpisode) {
+                                return LoopStep.BREAK_EPISODE
+                            }
+                            if (snapshots.value.bootstrapPending) return LoopStep.CONTINUE_EPISODE
+                        }
+                    }
                 }
                 return LoopStep.PROCEED
             }
@@ -349,6 +396,7 @@ internal class TunnelRecovery(
                 seamlessRecoveryAttempted = 0
                 exhausted = false
                 fastSettle = false
+                ipv6FallbackTried = false
             }
         }
     }
@@ -368,21 +416,16 @@ internal class TunnelRecovery(
         // network cannot use IPv6
         val previous =
             snap.lastResolvedPeers?.let { BootstrapResolution(it, resolvedTunnelDnsConfig = null) }
-        val merged = freshBootstrapResolution.mergeWith(previous, snap.networkHasIpv6)
+        val merged = freshBootstrapResolution.mergeWith(previous, snap.networkIpv6)
 
         // If peers are already on IPv6 but this network has no IPv6, ForceIpv4
-        val familyOverride =
-            if (!snap.networkHasIpv6 && activeConfig.hasIpv6Peers()) {
-                FamilyOverride.ForceIpv4
-            } else {
-                FamilyOverride.MatchCurrent
-            }
+        val familyOverride = ddnsRecoveryFamily(snap.networkIpv6, activeConfig.hasIpv6Peers())
 
         val mismatches =
             activeConfig.findEndpointMismatches(
                 merged.peerKeyResults,
                 familyOverride,
-                networkHasIpv6 = snap.networkHasIpv6,
+                networkIpv6 = snap.networkIpv6,
             )
 
         // Always refresh the cache as merged so a later ForceIpv4 path still sees IPv4 records
@@ -391,7 +434,7 @@ internal class TunnelRecovery(
         if (mismatches.isEmpty()) {
             log.w {
                 "DDNS Recovery: no endpoint IP change detected " +
-                    "(family=$familyOverride networkHasIpv6=${snap.networkHasIpv6})"
+                    "(family=$familyOverride networkIpv6=${snap.networkIpv6})"
             }
             return
         }
@@ -409,6 +452,11 @@ internal class TunnelRecovery(
 
     @OptIn(ExperimentalAtomicApi::class)
     private suspend fun tryLightIpv4Fallback(snap: Snapshot) {
+        // Not latched, so the fallback runs on a later pass once the reading is known
+        if (snap.networkIpv6 == Ipv6Support.Unknown) {
+            log.d { "Ipv4 Fallback: network IPv6 unknown, keeping peers for tunnel $tunnelId" }
+            return
+        }
         val activeConfig = host.getActiveConfig() ?: return
         if (!activeConfig.hasIpv6Peers()) return
 
@@ -418,7 +466,7 @@ internal class TunnelRecovery(
                 activeConfig.findEndpointMismatches(
                     dns,
                     FamilyOverride.ForceIpv4,
-                    networkHasIpv6 = snap.networkHasIpv6,
+                    networkIpv6 = snap.networkIpv6,
                 )
             } else {
                 emptyMap()
@@ -433,14 +481,14 @@ internal class TunnelRecovery(
                         return
                     }
             val previous = dns?.let { BootstrapResolution(it, resolvedTunnelDnsConfig = null) }
-            val merged = fresh.mergeWith(previous, snap.networkHasIpv6)
+            val merged = fresh.mergeWith(previous, snap.networkIpv6)
             host.updateActiveTunnel { it.copy(lastBootstrapResolution = merged) }
             dns = merged.peerKeyResults
             mismatches =
                 activeConfig.findEndpointMismatches(
                     dns,
                     FamilyOverride.ForceIpv4,
-                    networkHasIpv6 = snap.networkHasIpv6,
+                    networkIpv6 = snap.networkIpv6,
                 )
         }
 
@@ -455,6 +503,63 @@ internal class TunnelRecovery(
         val resolved = mode.config.buildResolvedPeers(mismatches)
         host.updatePeers(resolved)
         host.emit(TunnelEvent.FallbackToIpv4(tunnelId))
+    }
+
+    private sealed interface Ipv6FallbackResult {
+        /** Nothing to check (no active config, DNS or IPv4 peer), so a later pass may retry. */
+        data object NotChecked : Ipv6FallbackResult
+
+        /** No IPv4 peer has an AAAA record to try. */
+        data object NoIpv6Host : Ipv6FallbackResult
+
+        data class Switched(val previousPeers: List<PeerSection>) : Ipv6FallbackResult
+    }
+
+    /**
+     * Moves IPv4 peers that have an AAAA record to it, for servers whose IPv4 path is down while
+     * IPv6 works. The caller restores [Ipv6FallbackResult.Switched.previousPeers] if IPv6 does not
+     * answer either.
+     */
+    private suspend fun tryLightIpv6Fallback(snap: Snapshot): Ipv6FallbackResult {
+        val activeConfig = host.getActiveConfig() ?: return Ipv6FallbackResult.NotChecked
+        val ipv4Peers =
+            activeConfig.peers
+                .filter { it.endpoint != null && it.endpoint?.contains("[") == false }
+                .map { it.publicKey }
+                .toSet()
+        if (ipv4Peers.isEmpty()) return Ipv6FallbackResult.NotChecked
+
+        fun ipv6Hosts(dns: Map<PublicKey, DnsBootstrapResult>) =
+            activeConfig
+                .findEndpointMismatches(dns, FamilyOverride.PreferIpv6, Ipv6Support.Available)
+                .filter { (key, resolved) -> key in ipv4Peers && resolved.host.startsWith("[") }
+
+        var dns = snap.lastResolvedPeers
+        var mismatches = dns?.let(::ipv6Hosts).orEmpty()
+
+        // Cache may predate the AAAA, so resolve fresh
+        if (mismatches.isEmpty()) {
+            val fresh = host.resolveFresh() ?: return Ipv6FallbackResult.NotChecked
+            val previous = dns?.let { BootstrapResolution(it, resolvedTunnelDnsConfig = null) }
+            val merged = fresh.mergeWith(previous, snap.networkIpv6)
+            host.updateActiveTunnel { it.copy(lastBootstrapResolution = merged) }
+            dns = merged.peerKeyResults
+            mismatches = ipv6Hosts(dns)
+        }
+
+        if (mismatches.isEmpty()) {
+            log.d { "Ipv6 Fallback: no IPv6 endpoints available for tunnel $tunnelId" }
+            return Ipv6FallbackResult.NoIpv6Host
+        }
+
+        log.i {
+            "Ipv6 Fallback: IPv4 still failing, trying IPv6 for ${mismatches.size} peer(s) " +
+                "of tunnel $tunnelId"
+        }
+        // From live endpoints so peers that are not switched keep their current address
+        val live = mode.withEndpointsFrom(activeConfig).config
+        host.updatePeers(live.buildResolvedPeers(mismatches))
+        return Ipv6FallbackResult.Switched(previousPeers = live.peers)
     }
 
     // Full bounce now only does a fresh DNS request if tunnel is a DDNS tunnel.
@@ -482,7 +587,7 @@ internal class TunnelRecovery(
         val key = snap.activeNetworkKey
         return snap.recovery.ipv6Recovery &&
             snap.transportHealthy &&
-            snap.networkHasIpv6 &&
+            snap.networkIpv6 == Ipv6Support.Available &&
             !snap.bootstrapPending &&
             key != null &&
             key != lastIpv6RecoveryNetworkKey.load()
@@ -493,7 +598,9 @@ internal class TunnelRecovery(
         if (!snap.recovery.ipv6Recovery) return "ipv6 recovery disabled"
         if (!snap.transportHealthy) return "not healthy"
         if (snap.bootstrapPending) return "bootstrap pending"
-        if (!snap.networkHasIpv6) return "network has no ipv6"
+        if (snap.networkIpv6 != Ipv6Support.Available) {
+            return "network ipv6 ${snap.networkIpv6}"
+        }
         if (snap.activeNetworkKey == null) return "no network key"
         if (snap.activeNetworkKey == lastIpv6RecoveryNetworkKey.load()) {
             return "blocked: already attempted on ${snap.activeNetworkKey}"
@@ -517,7 +624,7 @@ internal class TunnelRecovery(
                                 transportHealthy = false,
                                 bootstrapPending = false,
                                 lastResolvedPeers = null,
-                                networkHasIpv6 = false,
+                                networkIpv6 = Ipv6Support.Unknown,
                                 activeNetworkKey = null,
                                 deviceAwake = false,
                             ),
@@ -525,7 +632,9 @@ internal class TunnelRecovery(
 
             launch {
                 snapshots.collect { snap ->
-                    if (!snap.transportHealthy || !snap.networkHasIpv6) return@collect
+                    if (!snap.transportHealthy || snap.networkIpv6 != Ipv6Support.Available) {
+                        return@collect
+                    }
                     ipv6SkipReason(snap)?.let { reason ->
                         log.d { "IPv6 recovery: skip ($reason) for tunnel $tunnelId" }
                     }
@@ -590,7 +699,7 @@ internal class TunnelRecovery(
                 activeConfig.findEndpointMismatches(
                     dns,
                     FamilyOverride.PreferIpv6,
-                    networkHasIpv6 = true,
+                    networkIpv6 = Ipv6Support.Available,
                 )
             } else {
                 emptyMap()
@@ -611,14 +720,14 @@ internal class TunnelRecovery(
                         }
                     }
             val previous = dns?.let { BootstrapResolution(it, resolvedTunnelDnsConfig = null) }
-            val merged = fresh.mergeWith(previous, networkHasIpv6 = true)
+            val merged = fresh.mergeWith(previous, Ipv6Support.Available)
             host.updateActiveTunnel { it.copy(lastBootstrapResolution = merged) }
             dns = merged.peerKeyResults
             mismatches =
                 activeConfig.findEndpointMismatches(
                     dns,
                     FamilyOverride.PreferIpv6,
-                    networkHasIpv6 = true,
+                    networkIpv6 = Ipv6Support.Available,
                 )
         }
 

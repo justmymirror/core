@@ -1,6 +1,7 @@
 package com.wgtunnel.backend.model.dns
 
 import com.wgtunnel.backend.enums.FamilyOverride
+import com.wgtunnel.backend.enums.Ipv6Support
 
 data class DnsBootstrapResult(
     val ipv4: List<String> = emptyList(),
@@ -10,17 +11,17 @@ data class DnsBootstrapResult(
      * Pick an endpoint host for a peer.
      *
      * - [FamilyOverride.ForceIpv4] never crosses to IPv6 (Ipv4Only / explicit fallback).
-     * - IPv6 candidates are omitted when [networkHasIpv6] is false so we do not pin a peer to an
-     *   unreachable family (see wgtunnel/android#1416).
-     * - Other modes keep cross-family fallback for DS-Lite / single-family DNS answers, but only
-     *   using IPv6 when the network can use it.
+     * - IPv6 candidates are omitted when [networkIpv6] is [Ipv6Support.Unavailable] so we do not
+     *   pin a peer to an unreachable family (see wgtunnel/android#1416). [Ipv6Support.Unknown]
+     *   keeps them, so a peer is not moved off IPv6 on a reading the monitor does not have yet.
+     * - Other modes keep cross-family fallback for DS-Lite / single-family DNS answers.
      *
      * Returning null means "no usable new host" — callers should keep the current endpoint.
      */
     fun selectHostForPeer(
         currentEndpoint: String?,
         familyOverride: FamilyOverride,
-        networkHasIpv6: Boolean = true,
+        networkIpv6: Ipv6Support = Ipv6Support.Available,
     ): String? {
         val currentlyIpv6 = currentEndpoint?.contains("[") == true
         val preferIpv6 =
@@ -30,7 +31,7 @@ data class DnsBootstrapResult(
                 FamilyOverride.PreferIpv6 -> true
             }
 
-        val ipv6Candidates = if (networkHasIpv6) ipv6 else emptyList()
+        val ipv6Candidates = if (networkIpv6 == Ipv6Support.Unavailable) emptyList() else ipv6
 
         val host =
             when (familyOverride) {
@@ -44,23 +45,32 @@ data class DnsBootstrapResult(
                     }
             } ?: return null
 
-        return if (host.contains(":") && !host.startsWith("[")) "[$host]" else host
+        return bracketed(host)
     }
 
     /**
-     * Merge a fresh answer with a previous one. When the network cannot use IPv6, keep the last
-     * known A records across a transient AAAA-only window so recovery still has a v4 candidate.
-     * When the network has IPv6, empty A is accepted (server may be IPv6-only).
+     * The only usable host of an AAAA-only answer. A peer that must be (re)started needs an IP, the
+     * engine rejects a hostname endpoint.
      */
-    fun mergeWith(previous: DnsBootstrapResult?, networkHasIpv6: Boolean): DnsBootstrapResult {
+    fun ipv6OnlyHost(): String? = if (ipv4.isEmpty()) ipv6.firstOrNull()?.let(::bracketed) else null
+
+    /**
+     * Merge a fresh answer with a previous one. Unless the network is known to have IPv6, keep the
+     * last known A records across a transient AAAA-only window so recovery still has a v4
+     * candidate. When the network has IPv6, empty A is accepted (server may be IPv6-only).
+     */
+    fun mergeWith(previous: DnsBootstrapResult?, networkIpv6: Ipv6Support): DnsBootstrapResult {
         if (previous == null) return this
         val mergedV4 =
             when {
                 ipv4.isNotEmpty() -> ipv4
-                !networkHasIpv6 -> previous.ipv4
+                networkIpv6 != Ipv6Support.Available -> previous.ipv4
                 else -> emptyList()
             }
         val mergedV6 = ipv6.ifEmpty { previous.ipv6 }
         return DnsBootstrapResult(ipv4 = mergedV4, ipv6 = mergedV6)
     }
+
+    private fun bracketed(host: String): String =
+        if (host.contains(":") && !host.startsWith("[")) "[$host]" else host
 }

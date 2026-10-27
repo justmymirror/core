@@ -5,7 +5,7 @@ import com.wgtunnel.backend.dns.CustomDnsResolver
 import com.wgtunnel.backend.dns.EndpointResolver
 import com.wgtunnel.backend.dns.SystemDnsResolver
 import com.wgtunnel.backend.dns.UnderlayNetworkSynchronizer
-import com.wgtunnel.backend.enums.FamilyOverride
+import com.wgtunnel.backend.enums.Ipv6Support
 import com.wgtunnel.backend.event.TunnelEvent
 import com.wgtunnel.backend.exception.BackendException
 import com.wgtunnel.backend.exception.ShellException
@@ -26,9 +26,12 @@ import com.wgtunnel.backend.state.BootstrapState
 import com.wgtunnel.backend.state.KillSwitchState
 import com.wgtunnel.backend.system.NetworkMonitor
 import com.wgtunnel.backend.system.PowerManager
+import com.wgtunnel.backend.system.ipv6Support
 import com.wgtunnel.backend.util.PublicKey
+import com.wgtunnel.backend.util.freshBounceFamily
 import com.wgtunnel.backend.util.hasDynamicEndpoints
 import com.wgtunnel.backend.util.hasIpv6Peers
+import com.wgtunnel.backend.util.initialBootstrapFamily
 import com.wgtunnel.backend.util.rebuildModeWithHostMap
 import com.wgtunnel.backend.util.withEndpointsFrom
 import com.wgtunnel.backend.util.withResolvedEndpoints
@@ -56,6 +59,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.job
@@ -65,6 +69,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 class TunnelBackend(
     private val scope: CoroutineScope,
@@ -261,6 +266,14 @@ class TunnelBackend(
         releaseTunnelHandle(handle)
     }
 
+    // DNS bootstrap waits for a network, but its IPv6 reading can still be settling. A short wait
+    // avoids picking a family on a reading the monitor does not have yet.
+    private suspend fun awaitIpv6Support(): Ipv6Support =
+        withTimeoutOrNull(2.seconds) {
+                networkMonitor.networkState.first { it.ipv6Support() != Ipv6Support.Unknown }
+            }
+            .ipv6Support()
+
     private suspend fun bootstrapAndStart(
         tunnel: Tunnel,
         mode: BackendMode,
@@ -277,16 +290,11 @@ class TunnelBackend(
             endpointResolver.resolve(mode, tunnelDnsConfig, listOfNotNull(outerConfig))
 
         // select peer endpoint IP family based on network state and preference
-        val networkHasIpv6 = networkMonitor.networkState.value?.hasIpv6 ?: false
-        val familyOverride =
-            if (tunnel.ipStrategy is Tunnel.IpStrategy.PreferIpv6 && networkHasIpv6) {
-                FamilyOverride.PreferIpv6
-            } else {
-                FamilyOverride.MatchCurrent
-            }
+        val networkIpv6 = awaitIpv6Support()
+        val familyOverride = initialBootstrapFamily(tunnel.ipStrategy, networkIpv6)
         log.i {
             "Endpoint family: strategy=${tunnel.ipStrategy::class.simpleName} " +
-                "networkHasIpv6=$networkHasIpv6 → $familyOverride"
+                "networkIpv6=$networkIpv6 → $familyOverride"
         }
 
         // No current endpoints yet, builds host map based on family preference
@@ -294,7 +302,7 @@ class TunnelBackend(
             bootstrapResolution.toHostMap(
                 currentEndpoints = emptyMap(),
                 familyOverride = familyOverride,
-                networkHasIpv6 = networkHasIpv6,
+                networkIpv6 = networkIpv6,
             )
         val runtimeMode = mode.rebuildModeWithHostMap(hostMap)
         val runtimeOuter = outerConfig?.withResolvedEndpoints(hostMap)
@@ -404,9 +412,7 @@ class TunnelBackend(
         val runtimeMode = mode.withEndpointsFrom(activeConfig)
         val previous = _status.value.activeTunnels[tunnel.id]?.lastBootstrapResolution
         val hostMap =
-            previous?.toHostMap(
-                networkHasIpv6 = networkMonitor.networkState.value?.hasIpv6 ?: false
-            )
+            previous?.toHostMap(networkIpv6 = networkMonitor.networkState.value.ipv6Support())
         restartDevice(
             handle,
             tunnel,
@@ -449,25 +455,18 @@ class TunnelBackend(
                 }
 
         val currentEndpoints = currentActiveConfig.peers.associate { it.publicKey to it.endpoint }
-        val networkHasIpv6 = networkMonitor.networkState.value?.hasIpv6 ?: false
+        val networkIpv6 = networkMonitor.networkState.value.ipv6Support()
         val previousResolution = _status.value.activeTunnels[tunnel.id]?.lastBootstrapResolution
-        val mergedResolution = bootstrapResult.mergeWith(previousResolution, networkHasIpv6)
+        val mergedResolution = bootstrapResult.mergeWith(previousResolution, networkIpv6)
 
-        // Force v4 when the network has no IPv6
         val familyOverride =
-            if (!networkHasIpv6 && currentActiveConfig.hasIpv6Peers()) {
-                FamilyOverride.ForceIpv4
-            } else if (tunnel.ipStrategy is Tunnel.IpStrategy.Ipv4Only) {
-                FamilyOverride.ForceIpv4
-            } else {
-                FamilyOverride.MatchCurrent
-            }
+            freshBounceFamily(tunnel.ipStrategy, networkIpv6, currentActiveConfig.hasIpv6Peers())
 
         val hostMap =
             mergedResolution.toHostMap(
                 currentEndpoints = currentEndpoints,
                 familyOverride = familyOverride,
-                networkHasIpv6 = networkHasIpv6,
+                networkIpv6 = networkIpv6,
             )
         val runtimeMode = mode.rebuildModeWithHostMap(hostMap)
 
@@ -838,6 +837,8 @@ class TunnelBackend(
             dynamicDnsRecovery = feature.dynamicDnsRecovery && hasDynamicEndpoints,
             ipv6Recovery = hasDynamicEndpoints && ipv6Restore,
             ipv4Fallback = feature.ipv4Fallback && hasDynamicEndpoints,
+            // Not tied to the IPv6 setting, an IPv4 path that is down must not strand the tunnel
+            ipv6Fallback = hasDynamicEndpoints,
         )
     }
 
@@ -914,7 +915,7 @@ class TunnelBackend(
                                                             BootstrapState.UpdatingPeers,
                                                 lastResolvedPeers =
                                                     active.lastBootstrapResolution?.peerKeyResults,
-                                                networkHasIpv6 = network.hasIpv6,
+                                                networkIpv6 = network.ipv6Support(),
                                                 activeNetworkKey = network.key,
                                                 deviceAwake = power.awake,
                                                 wakeEpoch = power.wakeCount,

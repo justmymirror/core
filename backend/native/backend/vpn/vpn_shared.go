@@ -65,7 +65,7 @@ func startVpnDevice(
 
 	conf, err := wireproxyawg.ParseConfigString(settings)
 	if err != nil {
-		log.Error(tag, "Invalid config file", err)
+		log.Error(tag, "Invalid config file: %v", err)
 		tun.Close()
 		return -1
 	}
@@ -162,7 +162,7 @@ func updateVpnTunnelPeers(handle int32, settings string) int32 {
 
 	conf, err := wireproxyawg.ParseConfigString(settings)
 	if err != nil {
-		log.Error(tag, "Invalid config file", err)
+		log.Error(tag, "Invalid config file: %v", err)
 		return -1
 	}
 

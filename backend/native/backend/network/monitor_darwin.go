@@ -83,7 +83,25 @@ func (m *darwinMonitor) Start() error {
 		go func() {
 			for {
 				_, err := unix.Read(fd, buf)
+				if err == unix.ENOBUFS || err == unix.EINTR {
+					// Route bursts on wake overflow the socket and drop messages,
+					// the socket itself still works. Refresh to catch what was lost.
+					select {
+					case readCh <- struct{}{}:
+					default:
+					}
+					continue
+				}
 				if err != nil {
+					// Stop closes stopCh before the socket
+					select {
+					case <-m.stopCh:
+						return
+					default:
+					}
+					// Never go quiet as a stale reading blocks recovery and auto tunnel
+					log.Error(tag, "AF_ROUTE read: %v (polling only)", err)
+					go m.pollLoop()
 					return
 				}
 				select {

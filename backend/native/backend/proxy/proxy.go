@@ -20,6 +20,7 @@ import (
 	"github.com/wgtunnel/backend/roaming"
 	"github.com/wgtunnel/backend/statusnotify"
 	"github.com/wgtunnel/backend/tunwrap"
+	"github.com/wgtunnel/backend/util"
 )
 
 const tag = "ProxyBackend"
@@ -143,6 +144,13 @@ func startProxy(handle int32, ifName string, config string, uapiPath string, byp
 		tunDevice.Close()
 		return -1
 	}
+	util.KickHandshakes(tunDevice, conf.Device.Peers, tag)
+	// Without a hop this device owns OS sockets, with one it sends through the outer netstack
+	role := util.RoleDirect
+	if outer != nil {
+		role = util.RoleInner
+	}
+	util.RegisterDevice(tunDevice, role)
 
 	virtualTun := &wireproxyawg.VirtualTun{
 		Tnet:           tnet,
@@ -202,6 +210,8 @@ func updateProxyTunnelPeers(tunnelHandle int32, settings string) int32 {
 		log.Error(tag, "IpcSet: %v", err)
 		return -1
 	}
+	// Retries may have stopped during a long outage, so reach the new endpoints now
+	util.KickHandshakes(virtualTun.Dev, conf.Device.Peers, tag)
 
 	log.Debug(tag, "Configuration updated successfully")
 	return 0
@@ -263,6 +273,7 @@ func turnProxyTunnelOff(virtualTunnelHandle int32) {
 	}
 
 	if virtualTun.Dev != nil {
+		util.UnregisterDevice(virtualTun.Dev)
 		virtualTun.Dev.Close()
 	}
 	hop.CloseAttached(virtualTunnelHandle)

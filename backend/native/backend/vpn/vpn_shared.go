@@ -23,6 +23,7 @@ import (
 	"github.com/wgtunnel/backend/roaming"
 	"github.com/wgtunnel/backend/statusnotify"
 	"github.com/wgtunnel/backend/tunwrap"
+	"github.com/wgtunnel/backend/util"
 )
 
 const tag = "VpnBackend"
@@ -142,6 +143,13 @@ func startVpnDevice(
 	}
 
 	log.Debug(tag, "Tunnel started successfully for handle %d", tunHandle)
+	util.KickHandshakes(tunDevice, conf.Device.Peers, tag)
+	// Without a hop this device owns OS sockets, with one it sends through the outer netstack
+	role := util.RoleDirect
+	if outer != nil {
+		role = util.RoleInner
+	}
+	util.RegisterDevice(tunDevice, role)
 	tunnelMu.Lock()
 	tunnelHandles[tunHandle] = TunnelHandle{device: tunDevice, uapi: uapi}
 	tunnelMu.Unlock()
@@ -176,6 +184,8 @@ func updateVpnTunnelPeers(handle int32, settings string) int32 {
 		log.Error(tag, "IpcSet: %v", err)
 		return -1
 	}
+	// Retries may have stopped during a long outage, so reach the new endpoints now
+	util.KickHandshakes(tunHandle.device, conf.Device.Peers, tag)
 
 	log.Debug(tag, "Configuration updated successfully with handle %d", handle)
 	return 0
@@ -199,6 +209,7 @@ func stopVpn(handle int32) {
 	// Router/DNS cleanup needs the TUN iface to still exist.
 	OnTunnelStopped(handle)
 	if tunHandle.device != nil {
+		util.UnregisterDevice(tunHandle.device)
 		tunHandle.device.Close()
 	}
 	hop.CloseAttached(handle)

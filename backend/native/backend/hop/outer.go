@@ -12,6 +12,7 @@ import (
 	"github.com/wgtunnel/backend/bind"
 	"github.com/wgtunnel/backend/log"
 	"github.com/wgtunnel/backend/roaming"
+	"github.com/wgtunnel/backend/util"
 )
 
 const (
@@ -75,6 +76,7 @@ func Start(config string, bypass bool) (*Outer, error) {
 		dev.Close()
 		return nil, err
 	}
+	util.RegisterDevice(dev, util.RoleOuter)
 	log.Debug(tag, "outer device up mtu=%d bypass=%v", mtu, bypass)
 	return &Outer{Dev: dev, Tnet: tnet, MTU: mtu, Addrs: setting.DeviceAddr}, nil
 }
@@ -83,6 +85,7 @@ func (o *Outer) Close() {
 	if o == nil || o.Dev == nil {
 		return
 	}
+	util.UnregisterDevice(o.Dev)
 	o.Dev.Close()
 	o.Dev = nil
 }

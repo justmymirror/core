@@ -10,6 +10,7 @@ import (
 	_ "github.com/wgtunnel/backend/killswitch"
 	_ "github.com/wgtunnel/backend/network"
 	_ "github.com/wgtunnel/backend/proxy"
+	_ "github.com/wgtunnel/backend/resume"
 	_ "github.com/wgtunnel/backend/statusnotify"
 	_ "github.com/wgtunnel/backend/vpn"
 )
